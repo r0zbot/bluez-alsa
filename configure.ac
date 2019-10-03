@@ -76,13 +76,7 @@ AM_COND_IF([ENABLE_APTX_SOURCE], [
 	AC_DEFINE([ENABLE_APTX_SOURCE], [1], [Define to 1 if apt-X source is enabled.])
 ])
 
-AC_ARG_ENABLE([aptx-sink],
-	[AS_HELP_STRING([--enable-aptx-sink], [enable apt-X decoding support powered by ffaptx])])
-AM_CONDITIONAL([ENABLE_APTX_SINK], [test "x$enable_aptx_sink" = "xyes"])
-AM_COND_IF([ENABLE_APTX_SINK], [
-	PKG_CHECK_MODULES([FFAPTX], [ffaptx >= 0.0.1])
-	AC_DEFINE([ENABLE_APTX_SINK], [1], [Define to 1 if apt-X sink is enabled.])
-])
+AC_DEFINE([ENABLE_APTX_SINK], [1], [Define to 1 if apt-X sink is enabled.])
 
 AC_ARG_ENABLE([ldac],
 	[AS_HELP_STRING([--enable-ldac], [enable LDAC encoding support])])

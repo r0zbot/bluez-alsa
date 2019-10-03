@@ -24,7 +24,8 @@ bluealsa_SOURCES = \
 	io.c \
 	rfcomm.c \
 	utils.c \
-	main.c
+	main.c \
+	ffaptx.c
 
 if ENABLE_MSBC
 bluealsa_SOURCES += \
@@ -40,7 +41,6 @@ endif
 AM_CFLAGS = \
 	@AAC_CFLAGS@ \
 	@OPENAPTX_CFLAGS@ \
-	@FFAPTX_CFLAGS@ \
 	@BLUEZ_CFLAGS@ \
 	@GIO2_CFLAGS@ \
 	@GLIB2_CFLAGS@ \
@@ -51,7 +51,6 @@ AM_CFLAGS = \
 
 LDADD = \
 	@AAC_LIBS@ \
-	@FFAPTX_LIBS@ \
 	@OPENAPTX_LIBS@ \
 	@BLUEZ_LIBS@ \
 	@GIO2_LIBS@ \
