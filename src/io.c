@@ -36,9 +36,7 @@
 # include <openaptx.h>
 #endif
 
-#if ENABLE_APTX_SINK
-# include <ffaptx.h>
-#endif
+#include <ffaptx.h>
 
 #if ENABLE_MP3LAME
 # include <lame/lame.h>
@@ -2412,7 +2410,6 @@ fail_ffb:
 	return NULL;
 }
 
-#if ENABLE_APTX_SINK
 static void *io_thread_a2dp_sink_aptx_aptxhd(bool hd, void* arg) {
 	struct ba_transport *t = (struct ba_transport *)arg;
 
@@ -2531,7 +2528,6 @@ static void *io_thread_a2dp_sink_aptx(void* arg) {
 static void *io_thread_a2dp_sink_aptxhd(void* arg) {
 	io_thread_a2dp_sink_aptx_aptxhd(true, arg);
 }
-#endif /* ENALBE_APTX_SINK */
 
 /**
  * Dump incoming BT data to a file. */
@@ -2595,7 +2591,7 @@ static void *io_thread_a2dp_sink_dump(void *arg) {
 			continue;
 		}
 
-		debug("BT read: %zd", len);
+		debug("BT read: %zd (dumped)", len);
 		fwrite(bt.data, 1, len, f);
 	}
 
@@ -2685,7 +2681,6 @@ int io_thread_create(struct ba_transport *t) {
 			name = "ba-io-aac";
 			break;
 #endif
-#if ENABLE_APTX_SINK
 		case A2DP_CODEC_VENDOR_APTX:
 			routine = io_thread_a2dp_sink_aptx;
 			name = "ba-io-aptx";
@@ -2694,7 +2689,6 @@ int io_thread_create(struct ba_transport *t) {
 			routine = io_thread_a2dp_sink_aptxhd;
 			name = "ba-io-aptxhd";
 			break;
-#endif
 		default:
 			warn("Codec not supported: %u", t->type.codec);
 		}

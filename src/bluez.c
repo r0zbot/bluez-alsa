@@ -324,7 +324,6 @@ static void bluez_endpoint_select_configuration(GDBusMethodInvocation *inv, void
 	}
 #endif
 
-#if ENABLE_APTX
 	case A2DP_CODEC_VENDOR_APTX: {
 
 		a2dp_aptx_t *cap = capabilities;
@@ -343,7 +342,6 @@ static void bluez_endpoint_select_configuration(GDBusMethodInvocation *inv, void
 
 		break;
 	}
-#endif
 
 #if ENABLE_LDAC
 	case A2DP_CODEC_VENDOR_LDAC: {
@@ -524,7 +522,6 @@ static void bluez_endpoint_set_configuration(GDBusMethodInvocation *inv, void *u
 			}
 #endif
 
-#if ENABLE_APTX
 			case A2DP_CODEC_VENDOR_APTX: {
 				a2dp_aptx_t *cap = capabilities;
 				cap_chm = cap->channel_mode;
@@ -538,7 +535,6 @@ static void bluez_endpoint_set_configuration(GDBusMethodInvocation *inv, void *u
 				cap_freq = cap->aptx.frequency;
 				break;
 			}
-#endif
 
 #if ENABLE_LDAC
 			case A2DP_CODEC_VENDOR_LDAC: {

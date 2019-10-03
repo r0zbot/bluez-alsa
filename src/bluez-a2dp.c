@@ -407,10 +407,8 @@ static const struct bluez_a2dp_codec *a2dp_codecs[] = {
 	&a2dp_codec_sink_mpeg,
 # endif
 #endif
-#if ENABLE_APTX_SINK
     &a2dp_codec_sink_aptx,
     &a2dp_codec_sink_aptxhd,
-#endif
 	&a2dp_codec_source_sbc,
 	&a2dp_codec_sink_sbc,
 	NULL,
