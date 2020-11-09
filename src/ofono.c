@@ -1,6 +1,6 @@
 /*
  * BlueALSA - ofono.c
- * Copyright (c) 2016-2019 Arkadiusz Bokowy
+ * Copyright (c) 2016-2020 Arkadiusz Bokowy
  *               2018 Thierry Bultel
  *
  * This file is a part of bluez-alsa.
@@ -41,6 +41,8 @@
 #include "ba-transport.h"
 #include "bluealsa.h"
 #include "bluealsa-dbus.h"
+#include "dbus.h"
+#include "hci.h"
 #include "hfp.h"
 #include "ofono-iface.h"
 #include "shared/log.h"
@@ -83,7 +85,6 @@ static int ofono_sco_socket_authorize(int fd) {
  * Ask oFono to connect to a card (in return it will call NewConnection). */
 static int ofono_acquire_bt_sco(struct ba_transport *t) {
 
-	GDBusConnection *conn = config.dbus;
 	GDBusMessage *msg = NULL, *rep = NULL;
 	GError *err = NULL;
 	int ret = 0;
@@ -94,7 +95,7 @@ static int ofono_acquire_bt_sco(struct ba_transport *t) {
 	msg = g_dbus_message_new_method_call(t->bluez_dbus_owner, ofono_dbus_path,
 			OFONO_IFACE_HF_AUDIO_CARD, "Connect");
 
-	if ((rep = g_dbus_connection_send_message_with_reply_sync(conn, msg,
+	if ((rep = g_dbus_connection_send_message_with_reply_sync(config.dbus, msg,
 					G_DBUS_SEND_MESSAGE_FLAGS_NONE, -1, NULL, NULL, &err)) == NULL)
 		goto fail;
 
@@ -137,12 +138,7 @@ static int ofono_release_bt_sco(struct ba_transport *t) {
 
 	shutdown(t->bt_fd, SHUT_RDWR);
 	close(t->bt_fd);
-
 	t->bt_fd = -1;
-	t->type.codec = HFP_CODEC_UNDEFINED;
-
-	bluealsa_dbus_transport_update(t,
-			BA_DBUS_TRANSPORT_UPDATE_SAMPLING | BA_DBUS_TRANSPORT_UPDATE_CODEC);
 
 	return 0;
 }
@@ -164,13 +160,45 @@ static struct ba_transport *ofono_transport_new(
 
 	struct ba_transport *t;
 
-	if ((t = ba_transport_new_sco(device, type, dbus_owner, dbus_path, NULL)) == NULL)
+	if ((t = ba_transport_new_sco(device, type, dbus_owner, dbus_path, -1)) == NULL)
 		return NULL;
 
-	t->sco.ofono = true;
 	t->acquire = ofono_acquire_bt_sco;
 	t->release = ofono_release_bt_sco;
 
+	return t;
+}
+
+/**
+ * Lookup a transport associated with oFono card.
+ *
+ * @param card A path associated with oFono card.
+ * @return On success this function returns a transport associated with
+ *   a given oFono card path. Otherwise, NULL is returned. */
+static struct ba_transport *ofono_transport_lookup(const char *card) {
+
+	struct ba_adapter *a = NULL;
+	struct ba_device *d = NULL;
+	struct ba_transport *t = NULL;
+
+	struct ofono_card_data *ocd;
+	if ((ocd = g_hash_table_lookup(ofono_card_data_map, card)) == NULL) {
+		error("Couldn't lookup oFono card data: %s", card);
+		goto fail;
+	}
+
+	if ((a = ba_adapter_lookup(ocd->hci_dev_id)) == NULL)
+		goto fail;
+	if ((d = ba_device_lookup(a, &ocd->bt_addr)) == NULL)
+		goto fail;
+	if ((t = ba_transport_lookup(d, ocd->transport_path)) == NULL)
+		goto fail;
+
+fail:
+	if (a != NULL)
+		ba_adapter_unref(a);
+	if (d != NULL)
+		ba_device_unref(d);
 	return t;
 }
 
@@ -218,9 +246,8 @@ static void ofono_card_add(const char *dbus_sender, const char *card,
 
 	debug("Adding new oFono card: %s", card);
 
-	if ((a = ba_adapter_lookup(hci_dev_id)) == NULL &&
-			(a = ba_adapter_new(hci_dev_id)) == NULL) {
-		error("Couldn't create new adapter: %s", strerror(errno));
+	if ((a = ba_adapter_lookup(hci_dev_id)) == NULL) {
+		error("Couldn't lookup adapter: hci%d: %s", hci_dev_id, strerror(errno));
 		goto fail;
 	}
 
@@ -244,7 +271,7 @@ static void ofono_card_add(const char *dbus_sender, const char *card,
 	g_hash_table_insert(ofono_card_data_map, g_strdup(card),
 			g_memdup(&ocd, sizeof(ocd)));
 
-	ba_transport_set_state(t, TRANSPORT_ACTIVE);
+	ba_transport_start(t);
 
 fail:
 	if (a != NULL)
@@ -261,7 +288,6 @@ fail:
  * Get all oFono cards (phones). */
 static int ofono_get_all_cards(void) {
 
-	GDBusConnection *conn = config.dbus;
 	GDBusMessage *msg = NULL, *rep = NULL;
 	GError *err = NULL;
 	int ret = 0;
@@ -269,7 +295,7 @@ static int ofono_get_all_cards(void) {
 	msg = g_dbus_message_new_method_call(OFONO_SERVICE, "/",
 			OFONO_IFACE_HF_AUDIO_MANAGER, "GetCards");
 
-	if ((rep = g_dbus_connection_send_message_with_reply_sync(conn, msg,
+	if ((rep = g_dbus_connection_send_message_with_reply_sync(config.dbus, msg,
 					G_DBUS_SEND_MESSAGE_FLAGS_NONE, -1, NULL, NULL, &err)) == NULL)
 		goto fail;
 
@@ -339,16 +365,12 @@ fail:
 
 }
 
-static void ofono_agent_new_connection(GDBusMethodInvocation *inv, void *userdata) {
-	(void)userdata;
+static void ofono_agent_new_connection(GDBusMethodInvocation *inv) {
 
 	GDBusMessage *msg = g_dbus_method_invocation_get_message(inv);
 	GVariant *params = g_dbus_method_invocation_get_parameters(inv);
 
-	struct ba_adapter *a = NULL;
-	struct ba_device *d = NULL;
 	struct ba_transport *t = NULL;
-
 	GError *err = NULL;
 	GUnixFDList *fd_list;
 	const char *card;
@@ -363,18 +385,10 @@ static void ofono_agent_new_connection(GDBusMethodInvocation *inv, void *userdat
 		goto fail;
 	}
 
-	struct ofono_card_data *ocd;
-	if ((ocd = g_hash_table_lookup(ofono_card_data_map, card)) == NULL) {
-		error("Card data not available: %s", card);
+	if ((t = ofono_transport_lookup(card)) == NULL) {
+		error("Couldn't lookup transport: %s: %s", card, strerror(errno));
 		goto fail;
 	}
-
-	if ((a = ba_adapter_lookup(ocd->hci_dev_id)) == NULL)
-		goto fail;
-	if ((d = ba_device_lookup(a, &ocd->bt_addr)) == NULL)
-		goto fail;
-	if ((t = ba_transport_lookup(d, ocd->transport_path)) == NULL)
-		goto fail;
 
 	if (ofono_sco_socket_authorize(fd) == -1) {
 		error("Couldn't authorize SCO connection: %s", strerror(errno));
@@ -384,15 +398,15 @@ static void ofono_agent_new_connection(GDBusMethodInvocation *inv, void *userdat
 	debug("New oFono SCO connection (codec: %#x): %d", codec, fd);
 
 	t->bt_fd = fd;
-	t->type.codec = codec;
+	t->mtu_read = t->mtu_write = hci_sco_get_mtu(fd);
 
-	t->mtu_read = 48;
-	t->mtu_write = 48;
+	ba_transport_set_codec(t, codec);
+	bluealsa_dbus_pcm_update(&t->sco.spk_pcm,
+			BA_DBUS_PCM_UPDATE_SAMPLING | BA_DBUS_PCM_UPDATE_CODEC);
+	bluealsa_dbus_pcm_update(&t->sco.mic_pcm,
+			BA_DBUS_PCM_UPDATE_SAMPLING | BA_DBUS_PCM_UPDATE_CODEC);
 
-	bluealsa_dbus_transport_update(t,
-			BA_DBUS_TRANSPORT_UPDATE_SAMPLING | BA_DBUS_TRANSPORT_UPDATE_CODEC);
-
-	ba_transport_send_signal(t, TRANSPORT_PING);
+	ba_transport_send_signal(t, BA_TRANSPORT_SIGNAL_PING);
 
 	g_dbus_method_invocation_return_value(inv, NULL);
 	goto final;
@@ -404,10 +418,6 @@ fail:
 		close(fd);
 
 final:
-	if (a != NULL)
-		ba_adapter_unref(a);
-	if (d != NULL)
-		ba_device_unref(d);
 	if (t != NULL)
 		ba_transport_unref(t);
 	if (err != NULL)
@@ -416,8 +426,7 @@ final:
 
 /**
  * Callback for the Release method, called when oFono is properly shutdown. */
-static void ofono_agent_release(GDBusMethodInvocation *inv, void *userdata) {
-	(void)userdata;
+static void ofono_agent_release(GDBusMethodInvocation *inv) {
 	ofono_remove_all_cards();
 	g_object_unref(inv);
 }
@@ -425,16 +434,20 @@ static void ofono_agent_release(GDBusMethodInvocation *inv, void *userdata) {
 static void ofono_hf_audio_agent_method_call(GDBusConnection *conn, const char *sender,
 		const char *path, const char *interface, const char *method, GVariant *params,
 		GDBusMethodInvocation *invocation, void *userdata) {
-	debug("Called: %s.%s()", interface, method);
 	(void)conn;
-	(void)sender;
-	(void)path;
 	(void)params;
+	(void)userdata;
 
-	if (strcmp(method, "NewConnection") == 0)
-		ofono_agent_new_connection(invocation, userdata);
-	else if (strcmp(method, "Release") == 0)
-		ofono_agent_release(invocation, userdata);
+	static const GDBusMethodCallDispatcher dispatchers[] = {
+		{ .method = "NewConnection",
+			.handler = ofono_agent_new_connection },
+		{ .method = "Release",
+			.handler = ofono_agent_release },
+		{ NULL },
+	};
+
+	if (!g_dbus_dispatch_method_call(dispatchers, sender, path, interface, method, invocation))
+		error("Couldn't dispatch D-Bus method call: %s.%s()", interface, method);
 
 }
 
@@ -444,11 +457,10 @@ static void ofono_hf_audio_agent_method_call(GDBusConnection *conn, const char *
  * @return On success this function returns 0. Otherwise -1 is returned. */
 int ofono_register(void) {
 
-	static GDBusInterfaceVTable vtable = {
+	static const GDBusInterfaceVTable vtable = {
 		.method_call = ofono_hf_audio_agent_method_call,
 	};
 
-	GDBusConnection *conn = config.dbus;
 	GDBusMessage *msg = NULL, *rep = NULL;
 	GError *err = NULL;
 	int ret = 0;
@@ -462,7 +474,7 @@ int ofono_register(void) {
 		ofono_card_data_map = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 
 	if (dbus_agent_object_id == 0)
-		if ((dbus_agent_object_id = g_dbus_connection_register_object(conn,
+		if ((dbus_agent_object_id = g_dbus_connection_register_object(config.dbus,
 						dbus_agent_object_path, (GDBusInterfaceInfo *)&ofono_iface_hf_audio_agent,
 						&vtable, NULL, NULL, &err)) == 0)
 			goto fail;
@@ -481,7 +493,7 @@ int ofono_register(void) {
 	g_dbus_message_set_body(msg, g_variant_new("(oay)", dbus_agent_object_path, &options));
 	g_variant_builder_clear(&options);
 
-	if ((rep = g_dbus_connection_send_message_with_reply_sync(conn, msg,
+	if ((rep = g_dbus_connection_send_message_with_reply_sync(config.dbus, msg,
 					G_DBUS_SEND_MESSAGE_FLAGS_NONE, -1, NULL, NULL, &err)) == NULL)
 		goto fail;
 
@@ -540,34 +552,18 @@ static void ofono_signal_card_removed(GDBusConnection *conn, const char *sender,
 	(void)path;
 	(void)userdata;
 
-	struct ba_adapter *a = NULL;
-	struct ba_device *d = NULL;
-	struct ba_transport *t = NULL;
-
 	const char *card = NULL;
 	g_variant_get(params, "(&o)", &card);
 
-	struct ofono_card_data *ocd;
-	if ((ocd = g_hash_table_lookup(ofono_card_data_map, card)) == NULL) {
-		error("Card data not available: %s", card);
-		goto fail;
+	struct ba_transport *t = NULL;
+	if ((t = ofono_transport_lookup(card)) == NULL) {
+		error("Couldn't lookup transport: %s: %s", card, strerror(errno));
+		return;
 	}
-
-	if ((a = ba_adapter_lookup(ocd->hci_dev_id)) == NULL)
-		goto fail;
-	if ((d = ba_device_lookup(a, &ocd->bt_addr)) == NULL)
-		goto fail;
-	if ((t = ba_transport_lookup(d, ocd->transport_path)) == NULL)
-		goto fail;
 
 	debug("Removing oFono card: %s", card);
 	ba_transport_destroy(t);
 
-fail:
-	if (a != NULL)
-		ba_adapter_unref(a);
-	if (d != NULL)
-		ba_device_unref(d);
 }
 
 /**
@@ -615,9 +611,33 @@ int ofono_subscribe_signals(void) {
 			OFONO_IFACE_HF_AUDIO_MANAGER, "CardRemoved", NULL, NULL,
 			G_DBUS_SIGNAL_FLAGS_NONE, ofono_signal_card_removed, NULL, NULL);
 
-	g_dbus_connection_signal_subscribe(config.dbus, "org.freedesktop.DBus",
-			"org.freedesktop.DBus", "NameOwnerChanged", NULL, OFONO_SERVICE,
+	g_dbus_connection_signal_subscribe(config.dbus, DBUS_SERVICE,
+			DBUS_IFACE_DBUS, "NameOwnerChanged", NULL, OFONO_SERVICE,
 			G_DBUS_SIGNAL_FLAGS_NONE, ofono_signal_name_owner_changed, NULL, NULL);
 
 	return 0;
+}
+
+/**
+ * Check whether oFono service is running. */
+bool ofono_detect_service(void) {
+
+	GDBusMessage *msg = NULL, *rep = NULL;
+	bool status = true;
+
+	debug("Checking oFono service presence");
+
+	msg = g_dbus_message_new_method_call(OFONO_SERVICE, "/",
+			OFONO_IFACE_MANAGER, "GetModems");
+	if ((rep = g_dbus_connection_send_message_with_reply_sync(config.dbus, msg,
+					G_DBUS_SEND_MESSAGE_FLAGS_NONE, -1, NULL, NULL, NULL)) == NULL ||
+			g_dbus_message_get_message_type(rep) == G_DBUS_MESSAGE_TYPE_ERROR)
+		status = false;
+
+	if (msg != NULL)
+		g_object_unref(msg);
+	if (rep != NULL)
+		g_object_unref(rep);
+
+	return status;
 }

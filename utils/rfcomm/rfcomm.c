@@ -1,6 +1,6 @@
 /*
  * BlueALSA - rfcomm.c
- * Copyright (c) 2016-2019 Arkadiusz Bokowy
+ * Copyright (c) 2016-2020 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -109,11 +109,11 @@ static void rl_callback_handler(char *line) {
 int main(int argc, char *argv[]) {
 
 	int opt;
-	const char *opts = "hVb:";
+	const char *opts = "hVB:";
 	const struct option longopts[] = {
 		{ "help", no_argument, NULL, 'h' },
 		{ "version", no_argument, NULL, 'V' },
-		{ "dbus", required_argument, NULL, 'b' },
+		{ "dbus", required_argument, NULL, 'B' },
 		{ 0, 0, 0, 0 },
 	};
 
@@ -130,7 +130,7 @@ usage:
 					"\nOptions:\n"
 					"  -h, --help\t\tprint this help and exit\n"
 					"  -V, --version\t\tprint version and exit\n"
-					"  -b, --dbus=NAME\tBlueALSA service name suffix\n",
+					"  -B, --dbus=NAME\tBlueALSA service name suffix\n",
 					argv[0]);
 			return EXIT_SUCCESS;
 
@@ -138,7 +138,7 @@ usage:
 			printf("%s\n", PACKAGE_VERSION);
 			return EXIT_SUCCESS;
 
-		case 'b' /* --dbus=NAME */ :
+		case 'B' /* --dbus=NAME */ :
 			snprintf(dbus_ba_service, sizeof(dbus_ba_service), BLUEALSA_SERVICE ".%s", optarg);
 			break;
 
@@ -170,7 +170,7 @@ usage:
 	char rfcomm_path[128];
 	sprintf(rfcomm_path, "/org/bluealsa/hci%d/dev_%.2X_%.2X_%.2X_%.2X_%.2X_%.2X/rfcomm",
 			hci_dev_id, addr.b[5], addr.b[4], addr.b[3], addr.b[2], addr.b[1], addr.b[0]);
-	if (!bluealsa_dbus_rfcomm_open(&dbus_ctx, rfcomm_path, &rfcomm_fd, &err)) {
+	if (!bluealsa_dbus_open_rfcomm(&dbus_ctx, rfcomm_path, &rfcomm_fd, &err)) {
 		error("Couldn't open RFCOMM: %s", err.message);
 		return EXIT_FAILURE;
 	}

@@ -1,6 +1,6 @@
 /*
  * BlueALSA - aplay.c
- * Copyright (c) 2016-2019 Arkadiusz Bokowy
+ * Copyright (c) 2016-2020 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -32,6 +32,8 @@
 #include "shared/defs.h"
 #include "shared/ffb.h"
 #include "shared/log.h"
+#include "alsa-pcm.h"
+#include "dbus.h"
 
 struct pcm_worker {
 	pthread_t thread;
@@ -50,7 +52,9 @@ struct pcm_worker {
 };
 
 static unsigned int verbose = 0;
-static const char *device = "default";
+static bool list_bt_devices = false;
+static bool list_bt_pcms = false;
+static const char *pcm_device = "default";
 static bool ba_profile_a2dp = true;
 static bool ba_addr_any = false;
 static bdaddr_t *ba_addrs = NULL;
@@ -81,142 +85,133 @@ static void main_loop_stop(int sig) {
 	main_loop_on = false;
 }
 
-static int pcm_set_hw_params(snd_pcm_t *pcm, int channels, int rate,
-		unsigned int *buffer_time, unsigned int *period_time, char **msg) {
+static int parse_bt_addresses(char *argv[], size_t count) {
 
-	const snd_pcm_access_t access = SND_PCM_ACCESS_RW_INTERLEAVED;
-	const snd_pcm_format_t format = SND_PCM_FORMAT_S16_LE;
-	snd_pcm_hw_params_t *params;
-	char buf[256];
-	int dir;
-	int err;
+	ba_addrs_count = count;
+	if ((ba_addrs = malloc(sizeof(*ba_addrs) * ba_addrs_count)) == NULL)
+		return -1;
 
-	snd_pcm_hw_params_alloca(&params);
-
-	if ((err = snd_pcm_hw_params_any(pcm, params)) < 0) {
-		snprintf(buf, sizeof(buf), "Set all possible ranges: %s", snd_strerror(err));
-		goto fail;
-	}
-	if ((err = snd_pcm_hw_params_set_access(pcm, params, access)) != 0) {
-		snprintf(buf, sizeof(buf), "Set assess type: %s: %s", snd_strerror(err), snd_pcm_access_name(access));
-		goto fail;
-	}
-	if ((err = snd_pcm_hw_params_set_format(pcm, params, format)) != 0) {
-		snprintf(buf, sizeof(buf), "Set format: %s: %s", snd_strerror(err), snd_pcm_format_name(format));
-		goto fail;
-	}
-	if ((err = snd_pcm_hw_params_set_channels(pcm, params, channels)) != 0) {
-		snprintf(buf, sizeof(buf), "Set channels: %s: %d", snd_strerror(err), channels);
-		goto fail;
-	}
-	if ((err = snd_pcm_hw_params_set_rate(pcm, params, rate, 0)) != 0) {
-		snprintf(buf, sizeof(buf), "Set sampling rate: %s: %d", snd_strerror(err), rate);
-		goto fail;
-	}
-	if ((err = snd_pcm_hw_params_set_buffer_time_near(pcm, params, buffer_time, &dir)) != 0) {
-		snprintf(buf, sizeof(buf), "Set buffer time: %s: %u", snd_strerror(err), *buffer_time);
-		goto fail;
-	}
-	if ((err = snd_pcm_hw_params_set_period_time_near(pcm, params, period_time, &dir)) != 0) {
-		snprintf(buf, sizeof(buf), "Set period time: %s: %u", snd_strerror(err), *period_time);
-		goto fail;
-	}
-	if ((err = snd_pcm_hw_params(pcm, params)) != 0) {
-		snprintf(buf, sizeof(buf), "%s", snd_strerror(err));
-		goto fail;
+	size_t i;
+	for (i = 0; i < ba_addrs_count; i++) {
+		if (str2ba(argv[i], &ba_addrs[i]) != 0)
+			return errno = EINVAL, -1;
+		if (bacmp(&ba_addrs[i], BDADDR_ANY) == 0)
+			ba_addr_any = true;
 	}
 
 	return 0;
-
-fail:
-	if (msg != NULL)
-		*msg = strdup(buf);
-	return err;
 }
 
-static int pcm_set_sw_params(snd_pcm_t *pcm, snd_pcm_uframes_t buffer_size,
-		snd_pcm_uframes_t period_size, char **msg) {
-
-	snd_pcm_sw_params_t *params;
-	char buf[256];
-	int err;
-
-	snd_pcm_sw_params_alloca(&params);
-
-	if ((err = snd_pcm_sw_params_current(pcm, params)) != 0) {
-		snprintf(buf, sizeof(buf), "Get current params: %s", snd_strerror(err));
-		goto fail;
+static snd_pcm_format_t bluealsa_get_snd_pcm_format(const struct ba_pcm *pcm) {
+	switch (pcm->format) {
+	case 0x0108:
+		return SND_PCM_FORMAT_U8;
+	case 0x8210:
+		return SND_PCM_FORMAT_S16_LE;
+	case 0x8318:
+		return SND_PCM_FORMAT_S24_3LE;
+	case 0x8418:
+		return SND_PCM_FORMAT_S24_LE;
+	case 0x8420:
+		return SND_PCM_FORMAT_S32_LE;
+	default:
+		error("Unknown PCM format: %#x", pcm->format);
+		return SND_PCM_FORMAT_UNKNOWN;
 	}
-
-	/* start the transfer when the buffer is full (or almost full) */
-	snd_pcm_uframes_t threshold = (buffer_size / period_size) * period_size;
-	if ((err = snd_pcm_sw_params_set_start_threshold(pcm, params, threshold)) != 0) {
-		snprintf(buf, sizeof(buf), "Set start threshold: %s: %lu", snd_strerror(err), threshold);
-		goto fail;
-	}
-
-	/* allow the transfer when at least period_size samples can be processed */
-	if ((err = snd_pcm_sw_params_set_avail_min(pcm, params, period_size)) != 0) {
-		snprintf(buf, sizeof(buf), "Set avail min: %s: %lu", snd_strerror(err), period_size);
-		goto fail;
-	}
-
-	if ((err = snd_pcm_sw_params(pcm, params)) != 0) {
-		snprintf(buf, sizeof(buf), "%s", snd_strerror(err));
-		goto fail;
-	}
-
-	return 0;
-
-fail:
-	if (msg != NULL)
-		*msg = strdup(buf);
-	return err;
 }
 
-static int pcm_open(snd_pcm_t **pcm, int channels, int rate,
-		unsigned int *buffer_time, unsigned int *period_time, char **msg) {
+static void print_bt_device_list(void) {
 
-	snd_pcm_t *_pcm = NULL;
-	char buf[256];
-	char *tmp;
-	int err;
+	static const struct {
+		const char *label;
+		unsigned int mode;
+	} section[2] = {
+		{ "**** List of PLAYBACK Bluetooth Devices ****", BA_PCM_MODE_SINK },
+		{ "**** List of CAPTURE Bluetooth Devices ****", BA_PCM_MODE_SOURCE },
+	};
 
-	if ((err = snd_pcm_open(&_pcm, device, SND_PCM_STREAM_PLAYBACK, 0)) != 0) {
-		snprintf(buf, sizeof(buf), "%s", snd_strerror(err));
-		goto fail;
+	const char *tmp;
+	size_t i, ii;
+
+	for (i = 0; i < ARRAYSIZE(section); i++) {
+		printf("%s\n", section[i].label);
+		for (ii = 0, tmp = ""; ii < ba_pcms_count; ii++) {
+
+			struct ba_pcm *pcm = &ba_pcms[ii];
+			struct bluez_device dev = { 0 };
+
+			if (!(pcm->modes & section[i].mode))
+				continue;
+
+			if (strcmp(pcm->device_path, tmp) != 0) {
+				tmp = ba_pcms[ii].device_path;
+
+				DBusError err = DBUS_ERROR_INIT;
+				if (dbus_bluez_get_device(dbus_ctx.conn, pcm->device_path, &dev, &err) == -1) {
+					warn("Couldn't get BlueZ device properties: %s", err.message);
+					dbus_error_free(&err);
+				}
+
+				char bt_addr[16];
+				ba2str(&dev.bt_addr, bt_addr);
+
+				printf("%s: %s [%s], %s%s\n",
+					dev.hci_name, bt_addr, dev.name,
+					dev.trusted ? "trusted ": "", dev.icon);
+
+			}
+
+			printf("  %s (%s): %s %d channel%s %d Hz\n",
+				pcm->profile == BA_PCM_PROFILE_A2DP ? "A2DP" : "SCO",
+				pcm->codec,
+				snd_pcm_format_name(bluealsa_get_snd_pcm_format(pcm)),
+				pcm->channels, pcm->channels != 1 ? "s" : "",
+				pcm->sampling);
+
+		}
 	}
 
-	if ((err = pcm_set_hw_params(_pcm, channels, rate, buffer_time, period_time, &tmp)) != 0) {
-		snprintf(buf, sizeof(buf), "Set HW params: %s", tmp);
-		goto fail;
+}
+
+static void print_bt_pcm_list(void) {
+
+	DBusError err = DBUS_ERROR_INIT;
+	struct bluez_device dev = { 0 };
+	const char *tmp = "";
+	size_t i;
+
+	for (i = 0; i < ba_pcms_count; i++) {
+		struct ba_pcm *pcm = &ba_pcms[i];
+
+		if (strcmp(pcm->device_path, tmp) != 0) {
+			tmp = ba_pcms[i].device_path;
+			if (dbus_bluez_get_device(dbus_ctx.conn, pcm->device_path, &dev, &err) == -1) {
+				warn("Couldn't get BlueZ device properties: %s", err.message);
+				dbus_error_free(&err);
+			}
+		}
+
+		char bt_addr[16];
+		ba2str(&dev.bt_addr, bt_addr);
+
+		printf(
+				"bluealsa:SRV=%s,DEV=%s,PROFILE=%s\n"
+				"    %s, %s%s, %s\n"
+				"    %s (%s): %s %d channel%s %d Hz\n",
+			dbus_ba_service,
+			bt_addr,
+			pcm->profile == BA_PCM_PROFILE_A2DP ? "a2dp" : "sco",
+			dev.name,
+			dev.trusted ? "trusted ": "", dev.icon,
+			pcm->modes & BA_PCM_MODE_SINK ? "playback" : "capture",
+			pcm->profile == BA_PCM_PROFILE_A2DP ? "A2DP" : "SCO",
+			pcm->codec,
+			snd_pcm_format_name(bluealsa_get_snd_pcm_format(pcm)),
+			pcm->channels, pcm->channels != 1 ? "s" : "",
+			pcm->sampling);
+
 	}
 
-	snd_pcm_uframes_t buffer_size, period_size;
-	if ((err = snd_pcm_get_params(_pcm, &buffer_size, &period_size)) != 0) {
-		snprintf(buf, sizeof(buf), "Get params: %s", snd_strerror(err));
-		goto fail;
-	}
-
-	if ((err = pcm_set_sw_params(_pcm, buffer_size, period_size, &tmp)) != 0) {
-		snprintf(buf, sizeof(buf), "Set SW params: %s", tmp);
-		goto fail;
-	}
-
-	if ((err = snd_pcm_prepare(_pcm)) != 0) {
-		snprintf(buf, sizeof(buf), "Prepare: %s", snd_strerror(err));
-		goto fail;
-	}
-
-	*pcm = _pcm;
-	return 0;
-
-fail:
-	if (_pcm != NULL)
-		snd_pcm_close(_pcm);
-	if (msg != NULL)
-		*msg = strdup(buf);
-	return err;
 }
 
 static struct ba_pcm *get_ba_pcm(const char *path) {
@@ -261,6 +256,7 @@ static int pause_device_player(const struct ba_pcm *ba_pcm) {
 	if ((rep = dbus_connection_send_with_reply_and_block(dbus_ctx.conn, msg,
 					DBUS_TIMEOUT_USE_DEFAULT, &err)) == NULL) {
 		warn("Couldn't pause player: %s", err.message);
+		dbus_error_free(&err);
 		goto fail;
 	}
 
@@ -275,7 +271,6 @@ final:
 		dbus_message_unref(msg);
 	if (rep != NULL)
 		dbus_message_unref(rep);
-
 	return ret;
 }
 
@@ -295,27 +290,28 @@ static void pcm_worker_routine_exit(struct pcm_worker *worker) {
 	debug("Exiting PCM worker %s", worker->addr);
 }
 
-static void *pcm_worker_routine(void *arg) {
-	struct pcm_worker *w = (struct pcm_worker *)arg;
+static void *pcm_worker_routine(struct pcm_worker *w) {
 
+	snd_pcm_format_t pcm_format = bluealsa_get_snd_pcm_format(&w->ba_pcm);
+	ssize_t pcm_format_size = snd_pcm_format_size(pcm_format, 1);
 	size_t pcm_1s_samples = w->ba_pcm.sampling * w->ba_pcm.channels;
-	ffb_int16_t buffer = { 0 };
+	ffb_t buffer = { 0 };
 
 	/* Cancellation should be possible only in the carefully selected place
 	 * in order to prevent memory leaks and resources not being released. */
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 
 	pthread_cleanup_push(PTHREAD_CLEANUP(pcm_worker_routine_exit), w);
-	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_int16_free), &buffer);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &buffer);
 
 	/* create buffer big enough to hold 100 ms of PCM data */
-	if (ffb_init(&buffer, pcm_1s_samples / 10) == NULL) {
-		error("Couldn't create PCM buffer: %s", strerror(ENOMEM));
+	if (ffb_init(&buffer, pcm_1s_samples / 10, pcm_format_size) == -1) {
+		error("Couldn't create PCM buffer: %s", strerror(errno));
 		goto fail;
 	}
 
 	DBusError err = DBUS_ERROR_INIT;
-	if (!bluealsa_dbus_pcm_open(&dbus_ctx, w->ba_pcm.pcm_path, BA_PCM_FLAG_SINK,
+	if (!bluealsa_dbus_open_pcm(&dbus_ctx, w->ba_pcm.pcm_path,
 				&w->ba_pcm_fd, &w->ba_pcm_ctrl_fd, &err)) {
 		error("Couldn't open PCM: %s", err.message);
 		dbus_error_free(&err);
@@ -324,13 +320,14 @@ static void *pcm_worker_routine(void *arg) {
 
 	/* Initialize the max read length to 10 ms. Later, when the PCM device
 	 * will be opened, this value will be adjusted to one period size. */
-	size_t pcm_max_read_len = pcm_1s_samples / 100;
+	size_t pcm_max_read_len_init = pcm_1s_samples / 100 * pcm_format_size;
+	size_t pcm_max_read_len = pcm_max_read_len_init;
 	size_t pcm_open_retries = 0;
 
 	/* These variables determine how and when the pause command will be send
 	 * to the device player. In order not to flood BT connection with AVRCP
 	 * packets, we are going to send pause command every 0.5 second. */
-	size_t pause_threshold = pcm_1s_samples / 2 * sizeof(int16_t);
+	size_t pause_threshold = pcm_1s_samples / 2 * pcm_format_size;
 	size_t pause_counter = 0;
 	size_t pause_bytes = 0;
 
@@ -356,7 +353,7 @@ static void *pcm_worker_routine(void *arg) {
 		case 0:
 			debug("Device marked as inactive: %s", w->addr);
 			pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-			pcm_max_read_len = pcm_1s_samples / 100;
+			pcm_max_read_len = pcm_max_read_len_init;
 			pause_counter = pause_bytes = 0;
 			ffb_rewind(&buffer);
 			if (w->pcm != NULL) {
@@ -373,8 +370,8 @@ static void *pcm_worker_routine(void *arg) {
 			break;
 
 		#define MIN(a,b) a < b ? a : b
-		size_t _in = MIN(pcm_max_read_len, ffb_len_in(&buffer));
-		if ((ret = read(w->ba_pcm_fd, buffer.tail, _in * sizeof(int16_t))) == -1) {
+		size_t _in = MIN(pcm_max_read_len, ffb_blen_in(&buffer));
+		if ((ret = read(w->ba_pcm_fd, buffer.tail, _in)) == -1) {
 			if (errno == EINTR)
 				continue;
 			error("PCM FIFO read error: %s", strerror(errno));
@@ -414,29 +411,32 @@ static void *pcm_worker_routine(void *arg) {
 				continue;
 			}
 
-			if (pcm_open(&w->pcm, w->ba_pcm.channels, w->ba_pcm.sampling,
-						&buffer_time, &period_time, &tmp) != 0) {
+			if (alsa_pcm_open(&w->pcm, pcm_device, pcm_format, w->ba_pcm.channels,
+						w->ba_pcm.sampling, &buffer_time, &period_time, &tmp) != 0) {
 				warn("Couldn't open PCM: %s", tmp);
-				pcm_max_read_len = buffer.size;
+				pcm_max_read_len = pcm_max_read_len_init;
 				usleep(50000);
 				free(tmp);
 				continue;
 			}
 
 			snd_pcm_get_params(w->pcm, &buffer_size, &period_size);
-			pcm_max_read_len = period_size * w->ba_pcm.channels;
+			pcm_max_read_len = period_size * w->ba_pcm.channels * pcm_format_size;
 			pcm_open_retries = 0;
 
 			if (verbose >= 2) {
 				printf("Used configuration for %s:\n"
 						"  PCM buffer time: %u us (%zu bytes)\n"
 						"  PCM period time: %u us (%zu bytes)\n"
+						"  PCM format: %s\n"
 						"  Sampling rate: %u Hz\n"
 						"  Channels: %u\n",
 						w->addr,
 						buffer_time, snd_pcm_frames_to_bytes(w->pcm, buffer_size),
 						period_time, snd_pcm_frames_to_bytes(w->pcm, period_size),
-						w->ba_pcm.sampling, w->ba_pcm.channels);
+						snd_pcm_format_name(pcm_format),
+						w->ba_pcm.sampling,
+						w->ba_pcm.channels);
 			}
 
 		}
@@ -445,8 +445,9 @@ static void *pcm_worker_routine(void *arg) {
 		w->active = true;
 		timeout = 500;
 
+		ffb_seek(&buffer, ret / pcm_format_size);
+
 		/* calculate the overall number of frames in the buffer */
-		ffb_seek(&buffer, ret / sizeof(*buffer.data));
 		snd_pcm_sframes_t frames = ffb_len_out(&buffer) / w->ba_pcm.channels;
 
 		if ((frames = snd_pcm_writei(w->pcm, buffer.data, frames)) < 0)
@@ -485,9 +486,11 @@ static int supervise_pcm_worker_start(struct ba_pcm *ba_pcm) {
 
 	workers_count++;
 	if (workers_size < workers_count) {
+		struct pcm_worker *tmp = workers;
 		workers_size += 4;  /* coarse-grained realloc */
 		if ((workers = realloc(workers, sizeof(*workers) * workers_size)) == NULL) {
 			error("Couldn't (re)allocate memory for PCM workers: %s", strerror(ENOMEM));
+			workers = tmp;
 			pthread_rwlock_unlock(&workers_lock);
 			return -1;
 		}
@@ -505,7 +508,8 @@ static int supervise_pcm_worker_start(struct ba_pcm *ba_pcm) {
 
 	debug("Creating PCM worker %s", worker->addr);
 
-	if ((errno = pthread_create(&worker->thread, NULL, pcm_worker_routine, worker)) != 0) {
+	if ((errno = pthread_create(&worker->thread, NULL,
+					PTHREAD_ROUTINE(pcm_worker_routine), worker)) != 0) {
 		error("Couldn't create PCM worker %s: %s", worker->addr, strerror(errno));
 		workers_count--;
 		return -1;
@@ -534,16 +538,16 @@ static int supervise_pcm_worker(struct ba_pcm *ba_pcm) {
 	if (ba_pcm == NULL)
 		return -1;
 
-	if (!(ba_pcm->flags & BA_PCM_FLAG_SINK))
+	if (!(ba_pcm->modes & BA_PCM_MODE_SOURCE))
 		goto stop;
 
-	if ((ba_profile_a2dp && !(ba_pcm->flags & BA_PCM_FLAG_PROFILE_A2DP)) ||
-			(!ba_profile_a2dp && !(ba_pcm->flags & BA_PCM_FLAG_PROFILE_SCO)))
+	if ((ba_profile_a2dp && ba_pcm->profile != BA_PCM_PROFILE_A2DP) ||
+			(!ba_profile_a2dp && ba_pcm->profile != BA_PCM_PROFILE_SCO))
 		goto stop;
 
 	/* check whether SCO has selected codec */
-	if (ba_pcm->flags & BA_PCM_FLAG_PROFILE_SCO &&
-			ba_pcm->codec == 0) {
+	if (ba_pcm->profile == BA_PCM_PROFILE_SCO &&
+			ba_pcm->sampling == 0) {
 		debug("Skipping SCO with codec not selected");
 		goto stop;
 	}
@@ -566,6 +570,9 @@ static DBusHandlerResult dbus_signal_handler(DBusConnection *conn, DBusMessage *
 	(void)conn;
 	(void)data;
 
+	if (dbus_message_get_type(message) != DBUS_MESSAGE_TYPE_SIGNAL)
+		return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+
 	const char *path = dbus_message_get_path(message);
 	const char *interface = dbus_message_get_interface(message);
 	const char *signal = dbus_message_get_member(message);
@@ -576,8 +583,10 @@ static DBusHandlerResult dbus_signal_handler(DBusConnection *conn, DBusMessage *
 	if (strcmp(interface, BLUEALSA_INTERFACE_MANAGER) == 0) {
 
 		if (strcmp(signal, "PCMAdded") == 0) {
+			struct ba_pcm *tmp = ba_pcms;
 			if ((ba_pcms = realloc(ba_pcms, (ba_pcms_count + 1) * sizeof(*ba_pcms))) == NULL) {
 				error("Couldn't add new PCM: %s", strerror(ENOMEM));
+				ba_pcms = tmp;
 				goto fail;
 			}
 			if (!dbus_message_iter_init(message, &iter) ||
@@ -625,13 +634,15 @@ fail:
 int main(int argc, char *argv[]) {
 
 	int opt;
-	const char *opts = "hVvb:d:";
+	const char *opts = "hVvlLB:D:";
 	const struct option longopts[] = {
 		{ "help", no_argument, NULL, 'h' },
 		{ "version", no_argument, NULL, 'V' },
 		{ "verbose", no_argument, NULL, 'v' },
-		{ "dbus", required_argument, NULL, 'b' },
-		{ "pcm", required_argument, NULL, 'd' },
+		{ "list-devices", no_argument, NULL, 'l' },
+		{ "list-pcms", no_argument, NULL, 'L' },
+		{ "dbus", required_argument, NULL, 'B' },
+		{ "pcm", required_argument, NULL, 'D' },
 		{ "pcm-buffer-time", required_argument, NULL, 3 },
 		{ "pcm-period-time", required_argument, NULL, 4 },
 		{ "profile-a2dp", no_argument, NULL, 1 },
@@ -643,25 +654,26 @@ int main(int argc, char *argv[]) {
 	while ((opt = getopt_long(argc, argv, opts, longopts, NULL)) != -1)
 		switch (opt) {
 		case 'h' /* --help */ :
-usage:
 			printf("Usage:\n"
-					"  %s [OPTION]... <BT-ADDR>...\n"
+					"  %s [OPTION]... [BT-ADDR]...\n"
 					"\nOptions:\n"
 					"  -h, --help\t\tprint this help and exit\n"
 					"  -V, --version\t\tprint version and exit\n"
 					"  -v, --verbose\t\tmake output more verbose\n"
-					"  -b, --dbus=NAME\tBlueALSA service name suffix\n"
-					"  -d, --pcm=NAME\tPCM device to use\n"
-					"  --pcm-buffer-time=INT\tPCM buffer time\n"
-					"  --pcm-period-time=INT\tPCM period time\n"
-					"  --profile-a2dp\tuse A2DP profile\n"
+					"  -l, --list-devices\tlist available BT audio devices\n"
+					"  -L, --list-pcms\tlist available BT audio PCMs\n"
+					"  -B, --dbus=NAME\tBlueALSA service name suffix\n"
+					"  -D, --pcm=NAME\tplayback PCM device to use\n"
+					"  --pcm-buffer-time=INT\tplayback PCM buffer time\n"
+					"  --pcm-period-time=INT\tplayback PCM period time\n"
+					"  --profile-a2dp\tuse A2DP profile (default)\n"
 					"  --profile-sco\t\tuse SCO profile\n"
 					"  --single-audio\tsingle audio mode\n"
 					"\nNote:\n"
 					"If one wants to receive audio from more than one Bluetooth device, it is\n"
 					"possible to specify more than one MAC address. By specifying any/empty MAC\n"
 					"address (00:00:00:00:00:00), one will allow connections from any Bluetooth\n"
-					"device.\n",
+					"device. Without given explicit MAC address any/empty MAC is assumed.\n",
 					argv[0]);
 			return EXIT_SUCCESS;
 
@@ -673,11 +685,18 @@ usage:
 			verbose++;
 			break;
 
-		case 'b' /* --dbus=NAME */ :
+		case 'l' /* --list-devices */ :
+			list_bt_devices = true;
+			break;
+		case 'L' /* --list-pcms */ :
+			list_bt_pcms = true;
+			break;
+
+		case 'B' /* --dbus=NAME */ :
 			snprintf(dbus_ba_service, sizeof(dbus_ba_service), BLUEALSA_SERVICE ".%s", optarg);
 			break;
-		case 'd' /* --pcm=NAME */ :
-			device = optarg;
+		case 'D' /* --pcm=NAME */ :
+			pcm_device = optarg;
 			break;
 
 		case 1 /* --profile-a2dp */ :
@@ -703,25 +722,36 @@ usage:
 			return EXIT_FAILURE;
 		}
 
-	if (optind == argc)
-		goto usage;
-
 	log_open(argv[0], false, false);
+	dbus_threads_init_default();
 
-	size_t i;
-
-	ba_addrs_count = argc - optind;
-	if ((ba_addrs = malloc(sizeof(*ba_addrs) * ba_addrs_count)) == NULL) {
-		error("Couldn't allocate memory for BT addresses");
+	DBusError err = DBUS_ERROR_INIT;
+	if (!bluealsa_dbus_connection_ctx_init(&dbus_ctx, dbus_ba_service, &err)) {
+		error("Couldn't initialize D-Bus context: %s", err.message);
 		return EXIT_FAILURE;
 	}
-	for (i = 0; i < ba_addrs_count; i++) {
-		if (str2ba(argv[i + optind], &ba_addrs[i]) != 0) {
-			error("Invalid BT device address: %s", argv[i + optind]);
+
+	if (list_bt_devices || list_bt_pcms) {
+
+		if (!bluealsa_dbus_get_pcms(&dbus_ctx, &ba_pcms, &ba_pcms_count, &err)) {
+			warn("Couldn't get BlueALSA PCM list: %s", err.message);
 			return EXIT_FAILURE;
 		}
-		if (bacmp(&ba_addrs[i], BDADDR_ANY) == 0)
-			ba_addr_any = true;
+
+		if (list_bt_pcms)
+			print_bt_pcm_list();
+
+		if (list_bt_devices)
+			print_bt_device_list();
+
+		return EXIT_SUCCESS;
+	}
+
+	if (optind == argc)
+		ba_addr_any = true;
+	else if (parse_bt_addresses(&argv[optind], argc - optind) == -1) {
+		error("Couldn't parse BT addresses: %s", strerror(errno));
+		return EXIT_FAILURE;
 	}
 
 	if (verbose >= 1) {
@@ -740,19 +770,12 @@ usage:
 				"  PCM period time: %u us\n"
 				"  Bluetooth device(s): %s\n"
 				"  Profile: %s\n",
-				dbus_ba_service, device, pcm_buffer_time, pcm_period_time,
+				dbus_ba_service,
+				pcm_device, pcm_buffer_time, pcm_period_time,
 				ba_addr_any ? "ANY" : &ba_str[2],
 				ba_profile_a2dp ? "A2DP" : "SCO");
 
 		free(ba_str);
-	}
-
-	dbus_threads_init_default();
-
-	DBusError err = DBUS_ERROR_INIT;
-	if (!bluealsa_dbus_connection_ctx_init(&dbus_ctx, dbus_ba_service, &err)) {
-		error("Couldn't initialize D-Bus context: %s", err.message);
-		return EXIT_FAILURE;
 	}
 
 	bluealsa_dbus_connection_signal_match_add(&dbus_ctx,
@@ -771,6 +794,7 @@ usage:
 	if (!bluealsa_dbus_get_pcms(&dbus_ctx, &ba_pcms, &ba_pcms_count, &err))
 		warn("Couldn't get BlueALSA PCM list: %s", err.message);
 
+	size_t i;
 	for (i = 0; i < ba_pcms_count; i++)
 		supervise_pcm_worker(&ba_pcms[i]);
 

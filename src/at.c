@@ -14,12 +14,12 @@
 #include <ctype.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
 #include "shared/defs.h"
 #include "shared/log.h"
-
 
 /**
  * Build AT message.
@@ -163,6 +163,32 @@ char *at_parse(const char *str, struct bt_at *at) {
 }
 
 /**
+ * Parse AT +BIA SET command value.
+ *
+ * @param str Command value string.
+ * @param state Array with the state to be updated.
+ * @return On success this function returns 0, otherwise -1 is returned. */
+int at_parse_bia(const char *str, bool state[__HFP_IND_MAX]) {
+
+	enum hfp_ind ind = HFP_IND_NULL + 1;
+	while (ind < __HFP_IND_MAX && *str != '\0') {
+		switch (*str) {
+		case '0':
+			state[ind] = false;
+			break;
+		case '1':
+			state[ind] = true;
+			break;
+		case ',':
+			ind++;
+		}
+		str++;
+	}
+
+	return 0;
+}
+
+/**
  * Parse AT +CIND GET response.
  *
  * The maximal number of possible mappings is 20. This value is hard-coded,
@@ -206,6 +232,30 @@ int at_parse_cind(const char *str, enum hfp_ind map[20]) {
 		if ((str = strstr(str, "),")) == NULL)
 			break;
 		str += 2;
+	}
+
+	return 0;
+}
+
+/**
+ * Parse AT +CMER SET command value.
+ *
+ * @param str CMER command value string.
+ * @param map Address where the CMER values will be stored.
+ * @return On success this function returns 0, otherwise -1 is returned. */
+int at_parse_cmer(const char *str, unsigned int map[5]) {
+
+	char *tmp;
+	size_t i;
+
+	for (i = 0; i < 5; i++) {
+		while (isspace(*str) || *str == ',')
+			str++;
+		int v = strtol(str, &tmp, 10);
+		if (str == tmp)
+			return *str == '\0' ? 0 : -1;
+		map[i] = v;
+		str = tmp;
 	}
 
 	return 0;

@@ -1,6 +1,6 @@
 /*
  * BlueALSA - log.c
- * Copyright (c) 2016-2018 Arkadiusz Bokowy
+ * Copyright (c) 2016-2020 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -12,14 +12,22 @@
 
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
 #include <time.h>
 
-#include "shared/rt.h"
+#if ENABLE_LIBUNWIND
+# define UNW_LOCAL_ONLY
+# include <libunwind.h>
+#elif HAVE_EXECINFO_H
+# include <execinfo.h>
+#endif
 
+#include "shared/defs.h"
+#include "shared/rt.h"
 
 /* internal logging identifier */
 static char *_ident = NULL;
@@ -27,7 +35,6 @@ static char *_ident = NULL;
 static bool _syslog = false;
 /* if true, print logging time */
 static bool _time = BLUEALSA_LOGTIME;
-
 
 void log_open(const char *ident, bool syslog, bool time) {
 
@@ -42,6 +49,17 @@ void log_open(const char *ident, bool syslog, bool time) {
 }
 
 static void vlog(int priority, const char *format, va_list ap) {
+
+	static const char *priority2str[] = {
+		[LOG_EMERG] = "X",
+		[LOG_ALERT] = "A",
+		[LOG_CRIT] = "C",
+		[LOG_ERR] = "E",
+		[LOG_WARNING] = "W",
+		[LOG_NOTICE] = "N",
+		[LOG_INFO] = "I",
+		[LOG_DEBUG] = "D",
+	};
 
 	int oldstate;
 
@@ -67,6 +85,7 @@ static void vlog(int priority, const char *format, va_list ap) {
 		gettimestamp(&ts);
 		fprintf(stderr, "%lu.%.9lu: ", (long int)ts.tv_sec, ts.tv_nsec);
 	}
+	fprintf(stderr, "%s: ", priority2str[priority]);
 	vfprintf(stderr, format, ap);
 	fputs("\n", stderr);
 
@@ -108,6 +127,53 @@ void _debug(const char *format, ...) {
 
 #if DEBUG
 /**
+ * Dump current thread's call stack. */
+void callstackdump(const char *label) {
+
+	char buffer[1024 * 2] = "Call stack backtrace not supported";
+	char *ptr = buffer;
+
+#if ENABLE_LIBUNWIND
+
+	unw_cursor_t cursor;
+	unw_context_t context;
+	unw_word_t off;
+
+	unw_getcontext(&context);
+	unw_init_local(&cursor, &context);
+
+	unw_step(&cursor);
+	while (unw_step(&cursor)) {
+		char symbol[256] = "";
+		unw_get_proc_name(&cursor, symbol, sizeof(symbol), &off);
+		ptr += snprintf(ptr, sizeof(buffer) + buffer - ptr, "%s+%#zx < ",
+				symbol, off);
+	}
+
+	ptr[-3] = '\0';
+
+#elif HAVE_EXECINFO_H
+
+	void *frames[32];
+	size_t n = backtrace(frames, ARRAYSIZE(frames));
+	char **symbols = backtrace_symbols(frames, n);
+
+	size_t i;
+	for (i = 1; i < n; i++)
+		ptr += snprintf(ptr, sizeof(buffer) + buffer - ptr, "%s%s",
+				symbols[i], (i + 1 < n) ? " < " : "");
+
+	free(symbols);
+
+#endif
+
+	_debug("%s: %s", label, buffer);
+
+}
+#endif
+
+#if DEBUG
+/**
  * Dump memory using hexadecimal representation.
  *
  * @param label Label printed before the memory block output.
@@ -120,10 +186,10 @@ void hexdump(const char *label, const void *mem, size_t len) {
 
 	while (len--) {
 		p += sprintf(p, " %02x", *(unsigned char *)mem & 0xFF);
-		mem += 1;
+		mem = ((unsigned char *)mem) + 1;
 	}
 
-	fprintf(stderr, "%s:%s\n", label, buf);
+	_debug("%s:%s", label, buf);
 	free(buf);
 }
 #endif

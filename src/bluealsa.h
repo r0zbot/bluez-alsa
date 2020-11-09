@@ -57,12 +57,23 @@ struct ba_config {
 
 	struct {
 		/* set of features exposed via Service Discovery */
-		int features_sdp_hf;
-		int features_sdp_ag;
+		unsigned int features_sdp_hf;
+		unsigned int features_sdp_ag;
 		/* set of features exposed via RFCOMM connection */
-		int features_rfcomm_hf;
-		int features_rfcomm_ag;
+		unsigned int features_rfcomm_hf;
+		unsigned int features_rfcomm_ag;
+		/* information exposed via Apple AT extension */
+		unsigned int xapl_vendor_id;
+		unsigned int xapl_product_id;
+		const char *xapl_software_version;
+		unsigned int xapl_features;
 	} hfp;
+
+	struct {
+		bool available;
+		/* host battery level (percentage) */
+		unsigned int level;
+	} battery;
 
 	struct {
 
@@ -89,8 +100,15 @@ struct ba_config {
 
 	} a2dp;
 
+	/* BlueALSA supports 4 SBC qualities: low, medium, high and XQ. The XQ mode
+	 * uses 44.1 kHz sampling rate, dual channel mode with bitpool 38, 16 blocks
+	 * in frame, 8 frequency bands and allocation method Loudness, which is also
+	 * known as SBC XQ Dual Channel HD. */
+	uint8_t sbc_quality;
+
 #if ENABLE_AAC
 	bool aac_afterburner;
+	uint8_t aac_latm_version;
 	uint8_t aac_vbr_mode;
 #endif
 

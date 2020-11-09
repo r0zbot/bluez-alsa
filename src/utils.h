@@ -1,6 +1,6 @@
 /*
  * BlueALSA - utils.h
- * Copyright (c) 2016-2019 Arkadiusz Bokowy
+ * Copyright (c) 2016-2020 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -17,39 +17,29 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-#include <time.h>
 
 #include <bluetooth/bluetooth.h>
 
-#include <gio/gio.h>
 #include <glib.h>
 
 #include "ba-transport.h"
-
-int a2dp_sbc_default_bitpool(int freq, int mode);
-
-int hci_open_sco(int dev_id, const bdaddr_t *ba, bool transparent);
-const char *batostr_(const bdaddr_t *ba);
 
 int g_dbus_bluez_object_path_to_hci_dev_id(const char *path);
 bdaddr_t *g_dbus_bluez_object_path_to_bdaddr(const char *path, bdaddr_t *addr);
 const char *g_dbus_transport_type_to_bluez_object_path(struct ba_transport_type type);
 
-GVariantIter *g_dbus_get_managed_objects(GDBusConnection *conn,
-		const char *name, const char *path, GError **error);
-GVariant *g_dbus_get_property(GDBusConnection *conn, const char *service,
-		const char *path, const char *interface, const char *property,
-		GError **error);
-bool g_dbus_set_property(GDBusConnection *conn, const char *service,
-		const char *path, const char *interface, const char *property,
-		const GVariant *value, GError **error);
-
 char *g_variant_sanitize_object_path(char *path);
+bool g_variant_validate_value(GVariant *value, const GVariantType *type,
+		const char *name);
 
-void snd_pcm_scale_s16le(int16_t *buffer, size_t size, int channels,
-		double ch1_scale, double ch2_scale);
+unsigned int g_bdaddr_hash(const void *v);
+gboolean g_bdaddr_equal(const void *v1, const void *v2);
 
-const char *bluetooth_a2dp_codec_to_string(uint16_t codec);
+uint16_t ba_transport_codecs_a2dp_from_string(const char *str);
+const char *ba_transport_codecs_a2dp_to_string(uint16_t codec);
+uint16_t ba_transport_codecs_hfp_from_string(const char *str);
+const char *ba_transport_codecs_hfp_to_string(uint16_t codec);
+
 const char *ba_transport_type_to_string(struct ba_transport_type type);
 
 #if ENABLE_MP3LAME
@@ -58,10 +48,16 @@ const char *lame_encode_strerror(int err);
 #endif
 
 #if ENABLE_AAC
-#include <fdk-aac/aacdecoder_lib.h>
-#include <fdk-aac/aacenc_lib.h>
+# include <fdk-aac/aacdecoder_lib.h>
+# include <fdk-aac/aacenc_lib.h>
 const char *aacdec_strerror(AAC_DECODER_ERROR err);
 const char *aacenc_strerror(AACENC_ERROR err);
+#endif
+
+#if ENABLE_APTX || ENABLE_APTX_HD
+# include <openaptx.h>
+void aptxbtenc_destroy_free(APTXENC enc);
+void aptxhdbtenc_destroy_free(APTXENC enc);
 #endif
 
 #if ENABLE_LDAC

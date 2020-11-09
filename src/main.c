@@ -1,6 +1,6 @@
 /*
  * BlueALSA - main.c
- * Copyright (c) 2016-2019 Arkadiusz Bokowy
+ * Copyright (c) 2016-2020 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -22,21 +22,26 @@
 #include <time.h>
 
 #include <gio/gio.h>
+#include <glib-unix.h>
 #include <glib.h>
 
 #if ENABLE_LDAC
 # include <ldacBT.h>
 #endif
 
+#include "a2dp.h"
 #include "bluealsa.h"
 #include "bluealsa-dbus.h"
 #include "bluealsa-iface.h"
-#include "bluez-a2dp.h"
 #include "bluez.h"
 #if ENABLE_OFONO
 # include "ofono.h"
 #endif
+#include "sbc.h"
 #include "utils.h"
+#if ENABLE_UPOWER
+# include "upower.h"
+#endif
 #include "shared/defs.h"
 #include "shared/log.h"
 
@@ -48,41 +53,36 @@
 	G_BUS_NAME_OWNER_FLAGS_NONE
 #endif
 
-static GMainLoop *loop = NULL;
 static int retval = EXIT_SUCCESS;
 
 static char *get_a2dp_codecs(
-		const struct bluez_a2dp_codec **codecs,
-		enum bluez_a2dp_dir dir) {
+		const struct a2dp_codec **codecs,
+		enum a2dp_dir dir) {
 
 	const char *tmp[16] = { NULL };
 	int i = 0;
 
 	while (*codecs != NULL) {
-		const struct bluez_a2dp_codec *c = *codecs++;
+		const struct a2dp_codec *c = *codecs++;
 		if (c->dir != dir)
 			continue;
-		tmp[i++] = bluetooth_a2dp_codec_to_string(c->id);
+		if ((tmp[i] = ba_transport_codecs_a2dp_to_string(c->codec_id)) == NULL)
+			tmp[i] = "N/A";
+		i++;
 	}
 
 	return g_strjoinv(", ", (char **)tmp);
 }
 
-static void main_loop_stop(int sig) {
-	/* Call to this handler restores the default action, so on the
-	 * second call the program will be forcefully terminated. */
-
-	struct sigaction sigact = { .sa_handler = SIG_DFL };
-	sigaction(sig, &sigact, NULL);
-
-	g_main_loop_quit(loop);
+static gboolean main_loop_exit_handler(void *userdata) {
+	g_main_loop_quit((GMainLoop *)userdata);
+	return G_SOURCE_REMOVE;
 }
 
 static void dbus_name_lost(GDBusConnection *conn, const char *name, void *userdata) {
 	(void)conn;
-	(void)userdata;
 	error("Couldn't acquire D-Bus name: %s", name);
-	g_main_loop_quit(loop);
+	g_main_loop_quit((GMainLoop *)userdata);
 	retval = EXIT_FAILURE;
 }
 
@@ -101,8 +101,10 @@ int main(int argc, char **argv) {
 		{ "a2dp-force-audio-cd", no_argument, NULL, 7 },
 		{ "a2dp-keep-alive", required_argument, NULL, 8 },
 		{ "a2dp-volume", no_argument, NULL, 9 },
+		{ "sbc-quality", required_argument, NULL, 14 },
 #if ENABLE_AAC
 		{ "aac-afterburner", no_argument, NULL, 4 },
+		{ "aac-latm-version", required_argument, NULL, 15 },
 		{ "aac-vbr-mode", required_argument, NULL, 5 },
 #endif
 #if ENABLE_LDAC
@@ -154,23 +156,25 @@ int main(int argc, char **argv) {
 					"  -V, --version\t\tprint version and exit\n"
 					"  -B, --dbus=NAME\tD-Bus service name suffix\n"
 					"  -S, --syslog\t\tsend output to syslog\n"
-					"  -i, --device=hciX\tHCI device to use\n"
+					"  -i, --device=hciX\tHCI device(s) to use\n"
 					"  -p, --profile=NAME\tenable BT profile\n"
 					"  --a2dp-force-mono\tforce monophonic sound\n"
 					"  --a2dp-force-audio-cd\tforce 44.1 kHz sampling\n"
 					"  --a2dp-keep-alive=SEC\tkeep A2DP transport alive\n"
-					"  --a2dp-volume\t\tcontrol volume natively\n"
+					"  --a2dp-volume\t\tnative volume control by default\n"
+					"  --sbc-quality=NB\tset SBC encoder quality\n"
 #if ENABLE_AAC
-					"  --aac-afterburner\tenable afterburner\n"
-					"  --aac-vbr-mode=NB\tset VBR mode to NB\n"
+					"  --aac-afterburner\tenable FDK AAC afterburner\n"
+					"  --aac-latm-version=NB\tselect LATM syntax version\n"
+					"  --aac-vbr-mode=NB\tselect FDK AAC encoder VBR mode\n"
 #endif
 #if ENABLE_LDAC
-					"  --ldac-abr\t\tenable adaptive bit rate\n"
-					"  --ldac-eqmid=NB\tset encoder quality to NB\n"
+					"  --ldac-abr\t\tenable LDAC adaptive bit rate\n"
+					"  --ldac-eqmid=NB\tset LDAC encoder quality\n"
 #endif
 #if ENABLE_MP3LAME
-					"  --mp3-quality=NB\tset encoder quality to NB\n"
-					"  --mp3-vbr-quality=NB\tset VBR quality to NB\n"
+					"  --mp3-quality=NB\tselect LAME encoder algorithm\n"
+					"  --mp3-vbr-quality=NB\tset LAME encoder VBR quality\n"
 #endif
 					"\nAvailable BT profiles:\n"
 					"  - a2dp-source\tAdvanced Audio Source (%s)\n"
@@ -187,8 +191,8 @@ int main(int argc, char **argv) {
 					"HSP/HFP Audio Gateways. If one wants to enable other set of profiles, it is\n"
 					"required to explicitly specify all of them using `-p NAME` options.\n",
 					argv[0],
-					get_a2dp_codecs(config.a2dp.codecs, BLUEZ_A2DP_SOURCE),
-					get_a2dp_codecs(config.a2dp.codecs, BLUEZ_A2DP_SINK),
+					get_a2dp_codecs(a2dp_codecs, A2DP_SOURCE),
+					get_a2dp_codecs(a2dp_codecs, A2DP_SINK),
 					"v1.7", "v1.7", "v1.2", "v1.2");
 			return EXIT_SUCCESS;
 
@@ -252,9 +256,28 @@ int main(int argc, char **argv) {
 			config.a2dp.volume = true;
 			break;
 
+		case 14 /* --sbc-quality=NB */ :
+			config.sbc_quality = atoi(optarg);
+			if (config.sbc_quality > SBC_QUALITY_XQ) {
+				error("Invalid encoder quality [0, %d]: %s", SBC_QUALITY_XQ, optarg);
+				return EXIT_FAILURE;
+			}
+			if (config.sbc_quality == SBC_QUALITY_XQ) {
+				info("Activating SBC Dual Channel HD (SBC XQ)");
+				config.a2dp.force_44100 = true;
+			}
+			break;
+
 #if ENABLE_AAC
 		case 4 /* --aac-afterburner */ :
 			config.aac_afterburner = true;
+			break;
+		case 15 /* --aac-latm-version=NB */ :
+			config.aac_latm_version = atoi(optarg);
+			if (config.aac_vbr_mode > 2) {
+				error("Invalid LATM version [0, 2]: %s", optarg);
+				return EXIT_FAILURE;
+			}
 			break;
 		case 5 /* --aac-vbr-mode=NB */ :
 			config.aac_vbr_mode = atoi(optarg);
@@ -301,8 +324,8 @@ int main(int argc, char **argv) {
 		}
 
 #if ENABLE_OFONO
-	if (config.enable.hfp_ofono) {
-		debug("Disabling native HFP due to enabled oFono");
+	if ((config.enable.hfp_ag || config.enable.hfp_hf) && config.enable.hfp_ofono) {
+		info("Disabling native HFP support due to enabled oFono profile");
 		config.enable.hfp_ag = false;
 		config.enable.hfp_hf = false;
 	}
@@ -330,6 +353,16 @@ int main(int argc, char **argv) {
 		return EXIT_FAILURE;
 	}
 
+#if ENABLE_OFONO
+	/* Enabling native HFP support while oFono is running might interfere
+	 * with oFono, so in the end neither BlueALSA nor oFono will work. */
+	if ((config.enable.hfp_ag || config.enable.hfp_hf) && ofono_detect_service()) {
+		warn("Disabling native HFP support due to oFono service presence");
+		config.enable.hfp_ag = false;
+		config.enable.hfp_hf = false;
+	}
+#endif
+
 	bluez_subscribe_signals();
 	bluez_register();
 
@@ -338,25 +371,28 @@ int main(int argc, char **argv) {
 	ofono_register();
 #endif
 
+#if ENABLE_UPOWER
+	upower_subscribe_signals();
+	upower_initialize();
+#endif
+
 	/* In order to receive EPIPE while writing to the pipe whose reading end
 	 * is closed, the SIGPIPE signal has to be handled. For more information
 	 * see the io_thread_write_pcm() function. */
 	struct sigaction sigact = { .sa_handler = SIG_IGN };
 	sigaction(SIGPIPE, &sigact, NULL);
 
-	/* register main loop exit handler */
-	sigact.sa_handler = main_loop_stop;
-	sigaction(SIGTERM, &sigact, NULL);
-	sigaction(SIGINT, &sigact, NULL);
+	GMainLoop *loop = g_main_loop_new(NULL, FALSE);
+	g_unix_signal_add(SIGINT, main_loop_exit_handler, loop);
+	g_unix_signal_add(SIGTERM, main_loop_exit_handler, loop);
 
 	/* register well-known service name */
 	debug("Acquiring D-Bus service name: %s", dbus_service);
 	g_bus_own_name_on_connection(config.dbus, dbus_service,
-			G_BUS_NAME_OWNER_FLAGS_DO_NOT_QUEUE, NULL, dbus_name_lost, NULL, NULL);
+			G_BUS_NAME_OWNER_FLAGS_DO_NOT_QUEUE, NULL, dbus_name_lost, loop, NULL);
 
 	/* main dispatching loop */
 	debug("Starting main dispatching loop");
-	loop = g_main_loop_new(NULL, FALSE);
 	g_main_loop_run(loop);
 
 	debug("Exiting main loop");

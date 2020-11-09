@@ -1,6 +1,6 @@
 /*
  * BlueALSA - bluealsa.c
- * Copyright (c) 2016-2019 Arkadiusz Bokowy
+ * Copyright (c) 2016-2020 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -11,13 +11,14 @@
 #include "bluealsa.h"
 
 #include <fcntl.h>
+#include <stdbool.h>
 
 #if ENABLE_LDAC
 # include <ldacBT.h>
 #endif
 
-#include "bluez-a2dp.h"
 #include "hfp.h"
+#include "sbc.h"
 
 /* Initialize global configuration variable. */
 struct ba_config config = {
@@ -53,19 +54,39 @@ struct ba_config config = {
 		HFP_AG_FEAT_REJECT |
 		HFP_AG_FEAT_ECS |
 		HFP_AG_FEAT_ECC |
-		HFP_AG_FEAT_EERC |
 		0,
+
+	/* build-in Apple accessory identification */
+	.hfp.xapl_vendor_id = 0xB103,
+	.hfp.xapl_product_id = 0xA15A,
+	.hfp.xapl_software_version = "0200",
+	.hfp.xapl_features =
+		XAPL_FEATURE_BATTERY |
+		XAPL_FEATURE_DOCKING |
+		0,
+
+	/* Initially set host battery as unavailable. If UPower integration was
+	 * enabled, this value will be automatically updated via D-Bus event. */
+	.battery.available = false,
+	.battery.level = 100,
 
 	.a2dp.volume = false,
 	.a2dp.force_mono = false,
 	.a2dp.force_44100 = false,
 	.a2dp.keep_alive = 0,
 
+	/* Try to use high SBC encoding quality as a default. */
+	.sbc_quality = SBC_QUALITY_HIGH,
+
 #if ENABLE_AAC
 	/* There are two issues with the afterburner: a) it uses a LOT of power,
 	 * b) it generates larger payload. These two reasons are good enough to
 	 * not enable afterburner by default. */
 	.aac_afterburner = false,
+	/* Use newer LATM syntax by default. Please note, that some older BT
+	 * devices might not understand this syntax, so for them it might be
+	 * required to use LATM version 0 (ISO-IEC 14496-3 (2001)). */
+	.aac_latm_version = 1,
 	.aac_vbr_mode = 4,
 #endif
 
@@ -90,8 +111,6 @@ int bluealsa_config_init(void) {
 	config.main_thread = pthread_self();
 
 	config.null_fd = open("/dev/null", O_WRONLY | O_NONBLOCK);
-
-	config.a2dp.codecs = bluez_a2dp_codecs;
 
 	return 0;
 }

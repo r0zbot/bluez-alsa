@@ -66,8 +66,8 @@
 #define XAPL_FEATURE_DENOISE (1 << 4)
 
 /**
- * HFP Connection States */
-enum __attribute__ ((packed)) hfp_state {
+ * HFP Service Level Connection States */
+enum __attribute__ ((packed)) hfp_slc_state {
 	HFP_DISCONNECTED,
 	HFP_SLC_BRSF_SET,
 	HFP_SLC_BRSF_SET_OK,
@@ -77,13 +77,17 @@ enum __attribute__ ((packed)) hfp_state {
 	HFP_SLC_CIND_GET,
 	HFP_SLC_CIND_GET_OK,
 	HFP_SLC_CMER_SET_OK,
-	/* Established Service Level Connection */
 	HFP_SLC_CONNECTED,
-	HFP_CC_BCS_SET,
-	HFP_CC_BCS_SET_OK,
-	/* Established Codec Connection */
-	HFP_CC_CONNECTED,
-	HFP_CONNECTED,
+};
+
+/**
+ * Initial BT accessory setup */
+enum __attribute__ ((packed)) hfp_setup {
+	HFP_SETUP_GAIN_MIC,
+	HFP_SETUP_GAIN_SPK,
+	HFP_SETUP_ACCESSORY_XAPL,
+	HFP_SETUP_ACCESSORY_BATT,
+	HFP_SETUP_COMPLETE,
 };
 
 /**

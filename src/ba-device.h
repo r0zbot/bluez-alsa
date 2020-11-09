@@ -43,13 +43,16 @@ struct ba_device {
 
 		uint16_t vendor_id;
 		uint16_t product_id;
-		uint16_t version;
+		char software_version[8];
 		uint8_t features;
 
 		/* determine whether headset is docked */
 		uint8_t accev_docked;
 
 	} xapl;
+
+	/* read-only list of available SEPs */
+	const GArray *seps;
 
 	/* hash-map with connected transports */
 	pthread_mutex_t transports_mutex;

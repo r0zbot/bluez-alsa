@@ -1,15 +1,19 @@
 # BlueALSA - configure.ac
-# Copyright (c) 2016-2019 Arkadiusz Bokowy
+# Copyright (c) 2016-2020 Arkadiusz Bokowy
 
 AC_PREREQ([2.60])
-AC_INIT([bluez-alsa], [1.4.0], [arkadiusz.bokowy@gmail.com])
+AC_INIT([BlueALSA],
+	[m4_normalize(esyscmd([test -d .git && git describe || echo v3.0.0]))],
+	[arkadiusz.bokowy@gmail.com], [bluez-alsa], [https://github.com/Arkq/bluez-alsa])
 AM_INIT_AUTOMAKE([foreign subdir-objects -Wall -Werror])
 
+AC_CONFIG_SRCDIR([src/bluealsa.c])
 AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_MACRO_DIR([m4])
 
 AC_USE_SYSTEM_EXTENSIONS
 AC_PROG_CC
+AC_PROG_CC_C99
 AC_PROG_INSTALL
 AM_PROG_AR
 AM_PROG_CC_C_O
@@ -32,6 +36,7 @@ AC_ARG_ENABLE([debug],
 	AS_HELP_STRING([--enable-debug], [enable debugging support]))
 AM_CONDITIONAL([ENABLE_DEBUG], [test "x$enable_debug" = "xyes"])
 AM_COND_IF([ENABLE_DEBUG], [
+	AC_CHECK_LIB([SegFault], [backtrace])
 	AC_DEFINE([DEBUG], [1], [Define to 1 if the debugging is enabled.])
 ])
 AC_ARG_ENABLE([debug-time],
@@ -41,6 +46,28 @@ AM_COND_IF([ENABLE_DEBUG_TIME], [
 	AC_DEFINE([DEBUG_TIME], [1], [Define to 1 if the debug timing is enabled.])
 ])
 
+# embedded test coverage
+AC_ARG_WITH([coverage],
+	AS_HELP_STRING([--with-coverage], [use lcov for test coverage reporting]))
+AM_CONDITIONAL([WITH_COVERAGE], [test "x$with_coverage" = "xyes"])
+AM_COND_IF([WITH_COVERAGE], [
+	AC_PATH_PROG([LCOV], [lcov])
+	AC_PATH_PROG([GENHTML], [genhtml])
+])
+
+# in-place call-stack unwinding
+AC_ARG_WITH([libunwind],
+	AS_HELP_STRING([--with-libunwind], [use libunwind for call-stack unwinding]))
+AM_CONDITIONAL([WITH_LIBUNWIND], [test "x$with_libunwind" = "xyes"])
+AM_COND_IF([WITH_LIBUNWIND], [
+	PKG_CHECK_MODULES([LIBUNWIND], [libunwind >= 1.1])
+	AC_DEFINE([ENABLE_LIBUNWIND], [1], [Define to 1 if libunwind shall be used.])
+], [
+	AC_CHECK_HEADERS([execinfo.h])
+])
+
+AC_CHECK_FUNCS([eventfd],
+	[], [AC_MSG_ERROR([unable to find eventfd() function])])
 AC_CHECK_FUNCS([splice],
 	[], [AC_MSG_ERROR([unable to find splice() function])])
 AC_SEARCH_LIBS([clock_gettime], [rt],
@@ -57,7 +84,7 @@ PKG_CHECK_MODULES([GLIB2], [glib-2.0 >= 2.30])
 PKG_CHECK_MODULES([GIO2], [gio-unix-2.0])
 PKG_CHECK_MODULES([SBC], [sbc >= 1.2])
 
-AM_CONDITIONAL([ALSA_1_1_2], [$PKG_CONFIG --atleast-version=1.1.2 alsa])
+AM_CONDITIONAL([ALSA_1_1_2__1_1_3], [$PKG_CONFIG "alsa >= 1.1.2 alsa <= 1.1.3"])
 AM_CONDITIONAL([ALSA_1_1_7], [$PKG_CONFIG --atleast-version=1.1.7 alsa])
 
 AC_ARG_ENABLE([aac],
@@ -82,6 +109,14 @@ AM_CONDITIONAL([ENABLE_APTX_SINK], [test "x$enable_aptx_sink" = "xyes"])
 AM_COND_IF([ENABLE_APTX_SINK], [
 	PKG_CHECK_MODULES([FFAPTX], [ffaptx >= 0.0.1])
 	AC_DEFINE([ENABLE_APTX_SINK], [1], [Define to 1 if apt-X sink is enabled.])
+])
+
+AC_ARG_ENABLE([aptx_hd],
+	[AS_HELP_STRING([--enable-aptx-hd], [enable apt-X HD encoding support])])
+AM_CONDITIONAL([ENABLE_APTX_HD], [test "x$enable_aptx_hd" = "xyes"])
+AM_COND_IF([ENABLE_APTX_HD], [
+	PKG_CHECK_MODULES([APTX_HD], [openaptxhd >= 1.2.0])
+	AC_DEFINE([ENABLE_APTX_HD], [1], [Define to 1 if apt-X HD is enabled.])
 ])
 
 AC_ARG_ENABLE([ldac],
@@ -126,6 +161,13 @@ AM_COND_IF([ENABLE_OFONO], [
 	AC_DEFINE([ENABLE_OFONO], [1], [Define to 1 if oFono is enabled.])
 ])
 
+AC_ARG_ENABLE([upower],
+	AS_HELP_STRING([--enable-upower], [enable UPower integration]))
+AM_CONDITIONAL([ENABLE_UPOWER], [test "x$enable_upower" = "xyes"])
+AM_COND_IF([ENABLE_UPOWER], [
+	AC_DEFINE([ENABLE_UPOWER], [1], [Define to 1 if UPower is enabled.])
+])
+
 AC_ARG_ENABLE([payloadcheck],
 	[AS_HELP_STRING([--disable-payloadcheck], [disable RTP payload type check (workaround for a PulseAudio bug)])])
 AM_CONDITIONAL([ENABLE_PAYLOADCHECK], [test "x$enable_payloadcheck" != "xno"])
@@ -141,12 +183,24 @@ AC_ARG_ENABLE([rfcomm],
 	[AS_HELP_STRING([--enable-rfcomm], [enable building of bluealsa-rfcomm tool])])
 AM_CONDITIONAL([ENABLE_RFCOMM], [test "x$enable_rfcomm" = "xyes"])
 
+AC_ARG_ENABLE([a2dpconf],
+	[AS_HELP_STRING([--enable-a2dpconf], [enable building of a2dpconf tool])])
+AM_CONDITIONAL([ENABLE_A2DPCONF], [test "x$enable_a2dpconf" = "xyes"])
+
 AC_ARG_ENABLE([hcitop],
 	[AS_HELP_STRING([--enable-hcitop], [enable building of hcitop tool])])
 AM_CONDITIONAL([ENABLE_HCITOP], [test "x$enable_hcitop" = "xyes"])
 AM_COND_IF([ENABLE_HCITOP], [
 	PKG_CHECK_MODULES([LIBBSD], [libbsd])
 	PKG_CHECK_MODULES([NCURSES], [ncurses])
+])
+
+AC_ARG_ENABLE([manpages],
+	AS_HELP_STRING([--enable-manpages], [enable building of man pages (requires rst2man)]))
+AM_CONDITIONAL([ENABLE_MANPAGES], [test "x$enable_manpages" = "xyes"])
+AM_COND_IF([ENABLE_MANPAGES], [
+	AC_PATH_PROGS([RST2MAN], [rst2man rst2man.py])
+	AS_IF([test "x$RST2MAN" = "x"], [AC_MSG_ERROR([[--enable-manpages requires rst2man]])])
 ])
 
 AC_ARG_ENABLE([test],
@@ -157,13 +211,22 @@ AM_COND_IF([ENABLE_TEST], [
 ])
 
 AC_ARG_WITH([dbusconfdir],
-	AC_HELP_STRING([--with-dbusconfdir=dir], [path to D-Bus system bus configuration files]),
+	AS_HELP_STRING([--with-dbusconfdir=dir], [path to D-Bus system bus configuration files]),
 	[dbusconfdir="${withval}"],
 	[dbusconfdir=$($PKG_CONFIG --variable=sysconfdir dbus-1)/dbus-1/system.d])
 AC_ARG_WITH([alsaplugindir],
 	AS_HELP_STRING([--with-alsaplugindir=dir], [path where ALSA plugin files are stored]),
 	[alsaplugindir="$withval"],
 	[alsaplugindir=$($PKG_CONFIG --variable=libdir alsa)/alsa-lib])
+
+# Unfortunately, for ALSA >= 1.1.7 the directory for add-on configuration files
+# is hard-coded as /etc/alsa/conf.d (unless the distribution has patched the
+# source codes). So, we will use that value as a default, unless (for backwards
+# compatibility) the user overrides it with --prefix or --sysconfdir option.
+if test "$sysconfdir" = "\${prefix}/etc"; then
+	test "x$prefix" = xNONE && sysconfdir=/etc
+fi
+
 AC_ARG_WITH([alsaconfdir],
 	AS_HELP_STRING([--with-alsaconfdir=dir], [path to ALSA add-on configuration files]),
 	[alsaconfdir="$withval"],
@@ -190,15 +253,18 @@ AC_SUBST([ALSA_PLUGIN_DIR], [$alsaplugindir])
 
 AC_CONFIG_FILES([
 	Makefile
+	doc/Makefile
 	src/Makefile
 	src/asound/Makefile
 	utils/Makefile
+	utils/aplay/Makefile
+	utils/rfcomm/Makefile
 	test/Makefile])
 AC_OUTPUT
 
 # warn user that alsa-lib thread-safety makes troubles
-AM_COND_IF([ALSA_1_1_2], [
-	AC_MSG_WARN([              *** alsa-lib >= 1.1.2 ***])
+AM_COND_IF([ALSA_1_1_2__1_1_3], [
+	AC_MSG_WARN([         *** alsa-lib >= 1.1.2, <= 1.1.3 ***])
 	AC_MSG_WARN([Starting from alsa-lib 1.1.2, it is possible to enable])
 	AC_MSG_WARN([thread-safe API functions. Unfortunately, this feature])
 	AC_MSG_WARN([is not mature enough - software plugins may experience])

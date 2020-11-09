@@ -1,6 +1,6 @@
 /*
  * BlueALSA - bluealsa-iface.c
- * Copyright (c) 2016-2019 Arkadiusz Bokowy
+ * Copyright (c) 2016-2020 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -10,12 +10,18 @@
 
 #include "bluealsa-iface.h"
 
-static const GDBusArgInfo arg_fd = {
-	-1, "fd", "h", NULL
+#include <stddef.h>
+
+static const GDBusArgInfo arg_codec = {
+	-1, "codec", "s", NULL
 };
 
-static const GDBusArgInfo arg_mode = {
-	-1, "mode", "s", NULL
+static const GDBusArgInfo arg_codecs = {
+	-1, "codecs", "a{sa{sv}}", NULL
+};
+
+static const GDBusArgInfo arg_fd = {
+	-1, "fd", "h", NULL
 };
 
 static const GDBusArgInfo arg_path = {
@@ -76,26 +82,48 @@ static const GDBusSignalInfo *bluealsa_iface_manager_signals[] = {
 	NULL,
 };
 
-static const GDBusArgInfo *pcm_Open_in[] = {
-	&arg_mode,
-	NULL,
-};
-
 static const GDBusArgInfo *pcm_Open_out[] = {
 	&arg_fd,
 	&arg_fd,
 	NULL,
 };
 
+static const GDBusArgInfo *pcm_GetCodecs_out[] = {
+	&arg_codecs,
+	NULL,
+};
+
+static const GDBusArgInfo *pcm_SelectCodec_in[] = {
+	&arg_codec,
+	&arg_props,
+	NULL,
+};
+
 static const GDBusMethodInfo bluealsa_iface_pcm_Open = {
 	-1, "Open",
-	(GDBusArgInfo **)pcm_Open_in,
+	NULL,
 	(GDBusArgInfo **)pcm_Open_out,
+	NULL,
+};
+
+static const GDBusMethodInfo bluealsa_iface_pcm_GetCodecs = {
+	-1, "GetCodecs",
+	NULL,
+	(GDBusArgInfo **)pcm_GetCodecs_out,
+	NULL,
+};
+
+static const GDBusMethodInfo bluealsa_iface_pcm_SelectCodec = {
+	-1, "SelectCodec",
+	(GDBusArgInfo **)pcm_SelectCodec_in,
+	NULL,
 	NULL,
 };
 
 static const GDBusMethodInfo *bluealsa_iface_pcm_methods[] = {
 	&bluealsa_iface_pcm_Open,
+	&bluealsa_iface_pcm_GetCodecs,
+	&bluealsa_iface_pcm_SelectCodec,
 	NULL,
 };
 
@@ -103,8 +131,16 @@ static const GDBusPropertyInfo bluealsa_iface_pcm_Device = {
 	-1, "Device", "o", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
 };
 
-static const GDBusPropertyInfo bluealsa_iface_pcm_Modes = {
-	-1, "Modes", "as", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
+static const GDBusPropertyInfo bluealsa_iface_pcm_Transport = {
+	-1, "Transport", "s", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
+};
+
+static const GDBusPropertyInfo bluealsa_iface_pcm_Mode = {
+	-1, "Mode", "s", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
+};
+
+static const GDBusPropertyInfo bluealsa_iface_pcm_Format = {
+	-1, "Format", "q", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
 };
 
 static const GDBusPropertyInfo bluealsa_iface_pcm_Channels = {
@@ -116,11 +152,18 @@ static const GDBusPropertyInfo bluealsa_iface_pcm_Sampling = {
 };
 
 static const GDBusPropertyInfo bluealsa_iface_pcm_Codec = {
-	-1, "Codec", "q", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
+	-1, "Codec", "s", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
 };
 
 static const GDBusPropertyInfo bluealsa_iface_pcm_Delay = {
 	-1, "Delay", "q", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
+};
+
+static const GDBusPropertyInfo bluealsa_iface_pcm_SoftVolume = {
+	-1, "SoftVolume", "b",
+	G_DBUS_PROPERTY_INFO_FLAGS_READABLE |
+	G_DBUS_PROPERTY_INFO_FLAGS_WRITABLE,
+	NULL
 };
 
 static const GDBusPropertyInfo bluealsa_iface_pcm_Volume = {
@@ -130,19 +173,17 @@ static const GDBusPropertyInfo bluealsa_iface_pcm_Volume = {
 	NULL
 };
 
-static const GDBusPropertyInfo bluealsa_iface_pcm_Battery = {
-	-1, "Battery", "y", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
-};
-
 static const GDBusPropertyInfo *bluealsa_iface_pcm_properties[] = {
 	&bluealsa_iface_pcm_Device,
-	&bluealsa_iface_pcm_Modes,
+	&bluealsa_iface_pcm_Transport,
+	&bluealsa_iface_pcm_Mode,
+	&bluealsa_iface_pcm_Format,
 	&bluealsa_iface_pcm_Channels,
 	&bluealsa_iface_pcm_Sampling,
 	&bluealsa_iface_pcm_Codec,
 	&bluealsa_iface_pcm_Delay,
+	&bluealsa_iface_pcm_SoftVolume,
 	&bluealsa_iface_pcm_Volume,
-	&bluealsa_iface_pcm_Battery,
 	NULL,
 };
 
@@ -163,17 +204,22 @@ static const GDBusMethodInfo *bluealsa_iface_rfcomm_methods[] = {
 	NULL,
 };
 
-static const GDBusPropertyInfo bluealsa_iface_rfcomm_Mode = {
-	-1, "Mode", "s", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
+static const GDBusPropertyInfo bluealsa_iface_rfcomm_Transport = {
+	-1, "Transport", "s", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
 };
 
 static const GDBusPropertyInfo bluealsa_iface_rfcomm_Features = {
 	-1, "Features", "u", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
 };
 
+static const GDBusPropertyInfo bluealsa_iface_rfcomm_Battery = {
+	-1, "Battery", "y", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
+};
+
 static const GDBusPropertyInfo *bluealsa_iface_rfcomm_properties[] = {
-	&bluealsa_iface_rfcomm_Mode,
+	&bluealsa_iface_rfcomm_Transport,
 	&bluealsa_iface_rfcomm_Features,
+	&bluealsa_iface_rfcomm_Battery,
 	NULL,
 };
 

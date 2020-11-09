@@ -5,7 +5,7 @@
  *  Copyright (C) 2006-2010  Nokia Corporation
  *  Copyright (C) 2004-2010  Marcel Holtmann <marcel@holtmann.org>
  *  Copyright (C) 2018       Pali Rohár <pali.rohar@gmail.com>
- *  Copyright (C) 2016-2019  Arkadiusz Bokowy
+ *  Copyright (C) 2016-2020  Arkadiusz Bokowy
  *
  *
  *  This library is free software; you can redistribute it and/or
@@ -30,18 +30,27 @@
 #include <endian.h>
 #include <stdint.h>
 
+#include "hci.h"
+
 #define A2DP_CODEC_SBC      0x00
 #define A2DP_CODEC_MPEG12   0x01
 #define A2DP_CODEC_MPEG24   0x02
 #define A2DP_CODEC_ATRAC    0x04
 #define A2DP_CODEC_VENDOR   0xFF
 
-/* customized 16-bit vendor extension */
+/* Customized (BlueALSA) 16-bit vendor extension. */
 #define A2DP_CODEC_VENDOR_APTX          0x4FFF
+#define A2DP_CODEC_VENDOR_APTX_AD       0xADFF
+#define A2DP_CODEC_VENDOR_APTX_HD       0x24FF
 #define A2DP_CODEC_VENDOR_APTX_LL       0xA2FF
-#define A2DP_CODEC_VENDOR_APTX_HD       0xD7FF
+#define A2DP_CODEC_VENDOR_APTX_TWS      0x25FF
 #define A2DP_CODEC_VENDOR_FASTSTREAM    0xA1FF
 #define A2DP_CODEC_VENDOR_LDAC          0x2DFF
+#define A2DP_CODEC_VENDOR_LHDC          0x4CFF
+#define A2DP_CODEC_VENDOR_LHDC_V1       0x48FF
+#define A2DP_CODEC_VENDOR_LLAC          0x44FF
+#define A2DP_CODEC_VENDOR_SAMSUNG_HD    0x52FF
+#define A2DP_CODEC_VENDOR_SAMSUNG_SC    0x53FF
 
 #define SBC_SAMPLING_FREQ_16000         (1 << 3)
 #define SBC_SAMPLING_FREQ_32000         (1 << 2)
@@ -67,11 +76,17 @@
 #define SBC_MIN_BITPOOL                 2
 #define SBC_MAX_BITPOOL                 250
 
-/* Other settings:
- * Block length = 16
- * Allocation method = Loudness
- * Subbands = 8
- */
+/**
+ * Predefined SBC bit-pool values.
+ *
+ * Other settings:
+ *  - block length = 16
+ *  - allocation method = Loudness
+ *  - sub-bands = 8 */
+#define SBC_BITPOOL_LQ_MONO_44100          15
+#define SBC_BITPOOL_LQ_MONO_48000          15
+#define SBC_BITPOOL_LQ_JOINT_STEREO_44100  29
+#define SBC_BITPOOL_LQ_JOINT_STEREO_48000  29
 #define SBC_BITPOOL_MQ_MONO_44100          19
 #define SBC_BITPOOL_MQ_MONO_48000          18
 #define SBC_BITPOOL_MQ_JOINT_STEREO_44100  35
@@ -215,29 +230,42 @@
 	.frequency1 = ((f) >> 4) & 0xff, \
 	.frequency2 = (f) & 0x0f,
 
-#define APTX_VENDOR_ID                  0x0000004f
+#define ATRAC_CHANNEL_MODE_MONO         0x04
+#define ATRAC_CHANNEL_MODE_DUAL_CHANNEL 0x02
+#define ATRAC_CHANNEL_MODE_JOINT_STEREO 0x01
+
+#define ATRAC_SAMPLING_FREQ_44100       0x02
+#define ATRAC_SAMPLING_FREQ_48000       0x01
+
+#define ATRAC_GET_BITRATE(a) \
+	((a).bitrate1 << 16 | (a).bitrate2 << 8 | (a).bitrate3)
+#define ATRAC_GET_MAX_SUL(a) \
+	((a).max_sul1 << 8 | (a).max_sul2)
+
+#define APTX_VENDOR_ID                  BT_COMPID_APT
 #define APTX_CODEC_ID                   0x0001
 
 #define APTX_CHANNEL_MODE_MONO          0x01
 #define APTX_CHANNEL_MODE_STEREO        0x02
+#define APTX_CHANNEL_MODE_TWS           0x08
 
 #define APTX_SAMPLING_FREQ_16000        0x08
 #define APTX_SAMPLING_FREQ_32000        0x04
 #define APTX_SAMPLING_FREQ_44100        0x02
 #define APTX_SAMPLING_FREQ_48000        0x01
 
-#define FASTSTREAM_VENDOR_ID            0x0000000a
+#define FASTSTREAM_VENDOR_ID            BT_COMPID_QUALCOMM_TECH_INTL
 #define FASTSTREAM_CODEC_ID             0x0001
 
-#define FASTSTREAM_DIRECTION_SINK               0x1
-#define FASTSTREAM_DIRECTION_SOURCE             0x2
+#define FASTSTREAM_DIRECTION_VOICE      0x2
+#define FASTSTREAM_DIRECTION_MUSIC      0x1
 
-#define FASTSTREAM_SINK_SAMPLING_FREQ_44100     0x2
-#define FASTSTREAM_SINK_SAMPLING_FREQ_48000     0x1
+#define FASTSTREAM_SAMPLING_FREQ_MUSIC_44100  0x2
+#define FASTSTREAM_SAMPLING_FREQ_MUSIC_48000  0x1
 
-#define FASTSTREAM_SOURCE_SAMPLING_FREQ_16000   0x2
+#define FASTSTREAM_SAMPLING_FREQ_VOICE_16000  0x2
 
-#define APTX_LL_VENDOR_ID               0x0000000a
+#define APTX_LL_VENDOR_ID               BT_COMPID_QUALCOMM_TECH_INTL
 #define APTX_LL_CODEC_ID                0x0002
 
 /* Default parameters for aptX Low Latency encoder */
@@ -260,10 +288,16 @@
 #define APTX_LL_GOOD_WORKING_LEVEL2     0xB4
 #define APTX_LL_GOOD_WORKING_LEVEL1     0x00
 
-#define APTX_HD_VENDOR_ID               0x000000D7
+#define APTX_HD_VENDOR_ID               BT_COMPID_QUALCOMM_TECH
 #define APTX_HD_CODEC_ID                0x0024
 
-#define LDAC_VENDOR_ID                  0x0000012d
+#define APTX_TWS_VENDOR_ID              BT_COMPID_QUALCOMM_TECH
+#define APTX_TWS_CODEC_ID               0x0025
+
+#define APTX_AD_VENDOR_ID               BT_COMPID_QUALCOMM_TECH
+#define APTX_AD_CODEC_ID                0x00ad
+
+#define LDAC_VENDOR_ID                  BT_COMPID_SONY
 #define LDAC_CODEC_ID                   0x00aa
 
 #define LDAC_SAMPLING_FREQ_44100        0x20
@@ -276,6 +310,21 @@
 #define LDAC_CHANNEL_MODE_MONO          0x04
 #define LDAC_CHANNEL_MODE_DUAL          0x02
 #define LDAC_CHANNEL_MODE_STEREO        0x01
+
+#define LHDC_VENDOR_ID                  BT_COMPID_SAVITECH
+#define LHDC_CODEC_ID                   0x4C32
+
+#define LHDC_V1_VENDOR_ID               BT_COMPID_SAVITECH
+#define LHDC_V1_CODEC_ID                0x484C
+
+#define LLAC_VENDOR_ID                  BT_COMPID_SAVITECH
+#define LLAC_CODEC_ID                   0x4C4C
+
+#define SAMSUNG_HD_VENDOR_ID            BT_COMPID_SAMSUNG_ELEC
+#define SAMSUNG_HD_CODEC_ID             0x0102
+
+#define SAMSUNG_SC_VENDOR_ID            BT_COMPID_SAMSUNG_ELEC
+#define SAMSUNG_SC_CODEC_ID             0x0103
 
 typedef struct {
 	uint8_t vendor_id4;
@@ -352,6 +401,21 @@ typedef struct {
 } __attribute__ ((packed)) a2dp_aac_t;
 
 typedef struct {
+	uint8_t rfa1:2;
+	uint8_t channel_mode:3;
+	uint8_t version:3;
+	uint8_t bitrate1:3;
+	uint8_t vbr:1;
+	uint8_t frequency:2;
+	uint8_t rfa2:2;
+	uint8_t bitrate2;
+	uint8_t bitrate3;
+	uint8_t max_sul1;
+	uint8_t max_sul2;
+	uint8_t rfa3;
+} __attribute__ ((packed)) a2dp_atrac_t;
+
+typedef struct {
 	a2dp_vendor_codec_t info;
 	uint8_t channel_mode:4;
 	uint8_t frequency:4;
@@ -360,8 +424,8 @@ typedef struct {
 typedef struct {
 	a2dp_vendor_codec_t info;
 	uint8_t direction;
-	uint8_t sink_frequency:4;
-	uint8_t source_frequency:4;
+	uint8_t frequency_music:4;
+	uint8_t frequency_voice:4;
 } __attribute__ ((packed)) a2dp_faststream_t;
 
 typedef struct {
@@ -423,6 +487,21 @@ typedef struct {
 } __attribute__ ((packed)) a2dp_aac_t;
 
 typedef struct {
+	uint8_t version:3;
+	uint8_t channel_mode:3;
+	uint8_t rfa1:2;
+	uint8_t rfa2:2;
+	uint8_t frequency:2;
+	uint8_t vbr:1;
+	uint8_t bitrate1:3;
+	uint8_t bitrate2;
+	uint8_t bitrate3;
+	uint8_t max_sul1;
+	uint8_t max_sul2;
+	uint8_t rfa3;
+} __attribute__ ((packed)) a2dp_atrac_t;
+
+typedef struct {
 	a2dp_vendor_codec_t info;
 	uint8_t frequency:4;
 	uint8_t channel_mode:4;
@@ -431,8 +510,8 @@ typedef struct {
 typedef struct {
 	a2dp_vendor_codec_t info;
 	uint8_t direction;
-	uint8_t source_frequency:4;
-	uint8_t sink_frequency:4;
+	uint8_t frequency_voice:4;
+	uint8_t frequency_music:4;
 } __attribute__ ((packed)) a2dp_faststream_t;
 
 typedef struct {

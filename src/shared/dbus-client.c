@@ -1,6 +1,6 @@
 /*
  * BlueALSA - dbus-client.c
- * Copyright (c) 2016-2019 Arkadiusz Bokowy
+ * Copyright (c) 2016-2020 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -66,6 +66,9 @@ dbus_bool_t bluealsa_dbus_connection_ctx_init(
 
 	if ((ctx->conn = dbus_bus_get_private(DBUS_BUS_SYSTEM, error)) == NULL)
 		return FALSE;
+
+	/* do not terminate in case of D-Bus connection being lost */
+	dbus_connection_set_exit_on_disconnect(ctx->conn, FALSE);
 
 	if (!dbus_connection_set_watch_functions(ctx->conn, ba_dbus_watch_add,
 				ba_dbus_watch_del, ba_dbus_watch_toggled, ctx, NULL)) {
@@ -293,7 +296,8 @@ success:
 dbus_bool_t bluealsa_dbus_get_pcm(
 		struct ba_dbus_ctx *ctx,
 		const bdaddr_t *addr,
-		unsigned int flags,
+		unsigned int profile,
+		unsigned int modes,
 		struct ba_pcm *pcm,
 		DBusError *error) {
 
@@ -307,7 +311,8 @@ dbus_bool_t bluealsa_dbus_get_pcm(
 
 	for (i = 0; i < length; i++)
 		if (bacmp(&pcms[i].addr, addr) == 0 &&
-				(pcms[i].flags & flags) == flags) {
+				pcms[i].profile == profile &&
+				(pcms[i].modes & modes) == modes) {
 			memcpy(pcm, &pcms[i], sizeof(*pcm));
 			goto final;
 		}
@@ -320,30 +325,19 @@ final:
 	return rv;
 }
 
-dbus_bool_t bluealsa_dbus_pcm_open(
+/**
+ * Open BlueALSA PCM stream. */
+dbus_bool_t bluealsa_dbus_open_pcm(
 		struct ba_dbus_ctx *ctx,
 		const char *pcm_path,
-		int operation_mode,
 		int *fd_pcm,
 		int *fd_pcm_ctrl,
 		DBusError *error) {
-
-	const char *mode = NULL;
-	if (operation_mode == BA_PCM_FLAG_SOURCE)
-		mode = "source";
-	else if (operation_mode == BA_PCM_FLAG_SINK)
-		mode = "sink";
 
 	DBusMessage *msg;
 	if ((msg = dbus_message_new_method_call(ctx->ba_service, pcm_path,
 					BLUEALSA_INTERFACE_PCM, "Open")) == NULL) {
 		dbus_set_error(error, DBUS_ERROR_NO_MEMORY, NULL);
-		return FALSE;
-	}
-
-	if (!dbus_message_append_args(msg, DBUS_TYPE_STRING, &mode, DBUS_TYPE_INVALID)) {
-		dbus_set_error(error, DBUS_ERROR_NO_MEMORY, NULL);
-		dbus_message_unref(msg);
 		return FALSE;
 	}
 
@@ -365,7 +359,9 @@ dbus_bool_t bluealsa_dbus_pcm_open(
 	return rv;
 }
 
-dbus_bool_t bluealsa_dbus_rfcomm_open(
+/**
+ * Open BlueALSA RFCOMM socket for dispatching AT commands. */
+dbus_bool_t bluealsa_dbus_open_rfcomm(
 		struct ba_dbus_ctx *ctx,
 		const char *rfcomm_path,
 		int *fd_rfcomm,
@@ -395,6 +391,66 @@ dbus_bool_t bluealsa_dbus_rfcomm_open(
 	return rv;
 }
 
+/**
+ * Update BlueALSA PCM property. */
+dbus_bool_t bluealsa_dbus_pcm_update(
+		struct ba_dbus_ctx *ctx,
+		const struct ba_pcm *pcm,
+		enum ba_pcm_property property,
+		DBusError *error) {
+
+	static const char *interface = BLUEALSA_INTERFACE_PCM;
+	const char *_property = NULL;
+	const char *variant = NULL;
+	const void *value = NULL;
+	int type = -1;
+
+	switch (property) {
+	case BLUEALSA_PCM_SOFT_VOLUME:
+		_property = "SoftVolume";
+		variant = DBUS_TYPE_BOOLEAN_AS_STRING;
+		value = &pcm->soft_volume;
+		type = DBUS_TYPE_BOOLEAN;
+		break;
+	case BLUEALSA_PCM_VOLUME:
+		_property = "Volume";
+		variant = DBUS_TYPE_UINT16_AS_STRING;
+		value = &pcm->volume.raw;
+		type = DBUS_TYPE_UINT16;
+		break;
+	}
+
+	DBusMessage *msg;
+	if ((msg = dbus_message_new_method_call(ctx->ba_service, pcm->pcm_path,
+					DBUS_INTERFACE_PROPERTIES, "Set")) == NULL)
+		goto fail;
+
+	DBusMessageIter iter;
+	DBusMessageIter iter_val;
+
+	dbus_message_iter_init_append(msg, &iter);
+	if (!dbus_message_iter_append_basic(&iter, DBUS_TYPE_STRING, &interface) ||
+			!dbus_message_iter_append_basic(&iter, DBUS_TYPE_STRING, &_property) ||
+			!dbus_message_iter_open_container(&iter, DBUS_TYPE_VARIANT, variant, &iter_val) ||
+			!dbus_message_iter_append_basic(&iter_val, type, value) ||
+			!dbus_message_iter_close_container(&iter, &iter_val))
+		goto fail;
+
+	if (!dbus_connection_send(ctx->conn, msg, NULL))
+		goto fail;
+
+	dbus_message_unref(msg);
+	return TRUE;
+
+fail:
+	if (msg != NULL)
+		dbus_message_unref(msg);
+	dbus_set_error(error, DBUS_ERROR_NO_MEMORY, NULL);
+	return FALSE;
+}
+
+/**
+ * Send command to the BlueALSA PCM controller socket. */
 dbus_bool_t bluealsa_dbus_pcm_ctrl_send(
 		int fd_pcm_ctrl,
 		const char *command,
@@ -492,11 +548,6 @@ dbus_bool_t bluealsa_dbus_message_iter_get_pcm(
 	dbus_message_iter_get_basic(iter, &path);
 	strncpy(pcm->pcm_path, path, sizeof(pcm->pcm_path) - 1);
 
-	if (strstr(path, "/a2dp") != NULL)
-		pcm->flags |= BA_PCM_FLAG_PROFILE_A2DP;
-	if (strstr(path, "/sco") != NULL)
-		pcm->flags |= BA_PCM_FLAG_PROFILE_SCO;
-
 	if (!dbus_message_iter_next(iter))
 		goto fail;
 
@@ -534,24 +585,28 @@ static dbus_bool_t bluealsa_dbus_message_iter_get_pcm_props_cb(const char *key,
 		strncpy(pcm->device_path, tmp, sizeof(pcm->device_path) - 1);
 		path2ba(tmp, &pcm->addr);
 	}
-	else if (strcmp(key, "Modes") == 0) {
-		if (type != DBUS_TYPE_ARRAY &&
-				dbus_message_iter_get_element_type(variant) != DBUS_TYPE_STRING) {
-			dbus_set_error(error, DBUS_ERROR_INVALID_SIGNATURE,
-					"Incorrect variant for '%s': %c%c != as", key,
-					type, dbus_message_iter_get_element_type(variant));
-			return FALSE;
-		}
-		DBusMessageIter iter_props_modes;
-		for (dbus_message_iter_recurse(variant, &iter_props_modes);
-				dbus_message_iter_get_arg_type(&iter_props_modes) != DBUS_TYPE_INVALID;
-				dbus_message_iter_next(&iter_props_modes)) {
-			dbus_message_iter_get_basic(&iter_props_modes, &tmp);
-			if (strcmp(tmp, "source") == 0)
-				pcm->flags |= BA_PCM_FLAG_SOURCE;
-			else if (strcmp(tmp, "sink") == 0)
-				pcm->flags |= BA_PCM_FLAG_SINK;
-		}
+	else if (strcmp(key, "Transport") == 0) {
+		if (type != (type_expected = DBUS_TYPE_STRING))
+			goto fail;
+		dbus_message_iter_get_basic(variant, &tmp);
+		if (strstr(tmp, "A2DP") != NULL)
+			pcm->profile = BA_PCM_PROFILE_A2DP;
+		else
+			pcm->profile = BA_PCM_PROFILE_SCO;
+	}
+	else if (strcmp(key, "Mode") == 0) {
+		if (type != (type_expected = DBUS_TYPE_STRING))
+			goto fail;
+		dbus_message_iter_get_basic(variant, &tmp);
+		if (strcmp(tmp, "source") == 0)
+			pcm->modes |= BA_PCM_MODE_SOURCE;
+		else if (strcmp(tmp, "sink") == 0)
+			pcm->modes |= BA_PCM_MODE_SINK;
+	}
+	else if (strcmp(key, "Format") == 0) {
+		if (type != (type_expected = DBUS_TYPE_UINT16))
+			goto fail;
+		dbus_message_iter_get_basic(variant, &pcm->format);
 	}
 	else if (strcmp(key, "Channels") == 0) {
 		if (type != (type_expected = DBUS_TYPE_BYTE))
@@ -564,14 +619,20 @@ static dbus_bool_t bluealsa_dbus_message_iter_get_pcm_props_cb(const char *key,
 		dbus_message_iter_get_basic(variant, &pcm->sampling);
 	}
 	else if (strcmp(key, "Codec") == 0) {
-		if (type != (type_expected = DBUS_TYPE_UINT16))
+		if (type != (type_expected = DBUS_TYPE_STRING))
 			goto fail;
-		dbus_message_iter_get_basic(variant, &pcm->codec);
+		dbus_message_iter_get_basic(variant, &tmp);
+		strncpy(pcm->codec, tmp, sizeof(pcm->codec) - 1);
 	}
 	else if (strcmp(key, "Delay") == 0) {
 		if (type != (type_expected = DBUS_TYPE_UINT16))
 			goto fail;
 		dbus_message_iter_get_basic(variant, &pcm->delay);
+	}
+	else if (strcmp(key, "SoftVolume") == 0) {
+		if (type != (type_expected = DBUS_TYPE_BOOLEAN))
+			goto fail;
+		dbus_message_iter_get_basic(variant, &pcm->soft_volume);
 	}
 	else if (strcmp(key, "Volume") == 0) {
 		if (type != (type_expected = DBUS_TYPE_UINT16))

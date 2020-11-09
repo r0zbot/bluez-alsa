@@ -1,5 +1,5 @@
 # BlueALSA - Makefile.am
-# Copyright (c) 2016-2019 Arkadiusz Bokowy
+# Copyright (c) 2016-2020 Arkadiusz Bokowy
 
 EXTRA_DIST = 20-bluealsa.conf
 
@@ -23,7 +23,9 @@ asound_module_confdir = @ALSA_CONF_DIR@
 AM_CFLAGS = \
 	-I$(top_srcdir)/src \
 	@ALSA_CFLAGS@ \
-	@DBUS1_CFLAGS@
+	@BLUEZ_CFLAGS@ \
+	@DBUS1_CFLAGS@ \
+	@LIBUNWIND_CFLAGS@
 
 AM_LDFLAGS = -module -avoid-version
 
@@ -32,4 +34,5 @@ libasound_module_ctl_bluealsa_la_LIBADD = \
 	@DBUS1_LIBS@
 libasound_module_pcm_bluealsa_la_LIBADD = \
 	@ALSA_LIBS@ \
-	@DBUS1_LIBS@
+	@DBUS1_LIBS@ \
+	@LIBUNWIND_LIBS@

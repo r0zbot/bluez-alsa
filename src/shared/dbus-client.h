@@ -1,6 +1,6 @@
 /*
  * BlueALSA - dbus-client.h
- * Copyright (c) 2016-2019 Arkadiusz Bokowy
+ * Copyright (c) 2016-2020 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -12,6 +12,7 @@
 #define BLUEALSA_SHARED_DBUSCLIENT_H_
 
 #include <poll.h>
+#include <stddef.h>
 #include <bluetooth/bluetooth.h>
 #include <dbus/dbus.h>
 
@@ -20,10 +21,10 @@
 #define BLUEALSA_INTERFACE_PCM     "org.bluealsa.PCM1"
 #define BLUEALSA_INTERFACE_RFCOMM  "org.bluealsa.RFCOMM1"
 
-#define BA_PCM_FLAG_SOURCE       (1 << 0)
-#define BA_PCM_FLAG_SINK         (1 << 1)
-#define BA_PCM_FLAG_PROFILE_A2DP (1 << 2)
-#define BA_PCM_FLAG_PROFILE_SCO  (1 << 3)
+#define BA_PCM_PROFILE_A2DP      (1 << 0)
+#define BA_PCM_PROFILE_SCO       (1 << 1)
+#define BA_PCM_MODE_SOURCE       (1 << 0)
+#define BA_PCM_MODE_SINK         (1 << 1)
 
 /**
  * Connection context. */
@@ -41,6 +42,13 @@ struct ba_dbus_ctx {
 };
 
 /**
+ * BlueALSA PCM object property. */
+enum ba_pcm_property {
+	BLUEALSA_PCM_SOFT_VOLUME,
+	BLUEALSA_PCM_VOLUME,
+};
+
+/**
  * BlueALSA PCM object. */
 struct ba_pcm {
 
@@ -49,6 +57,13 @@ struct ba_pcm {
 	/* BlueALSA D-Bus PCM path */
 	char pcm_path[128];
 
+	/* BlueALSA profile type */
+	unsigned int profile;
+	/* available stream modes */
+	unsigned int modes;
+
+	/* PCM stream format */
+	dbus_uint16_t format;
 	/* number of audio channels */
 	unsigned char channels;
 	/* PCM sampling frequency */
@@ -57,11 +72,11 @@ struct ba_pcm {
 	/* device address */
 	bdaddr_t addr;
 	/* transport codec */
-	dbus_uint16_t codec;
+	char codec[16];
 	/* approximate PCM delay */
 	dbus_uint16_t delay;
-	/* feature flags */
-	unsigned int flags;
+	/* software volume */
+	dbus_bool_t soft_volume;
 
 	/* 16-bit packed PCM volume */
 	union {
@@ -114,22 +129,28 @@ dbus_bool_t bluealsa_dbus_get_pcms(
 dbus_bool_t bluealsa_dbus_get_pcm(
 		struct ba_dbus_ctx *ctx,
 		const bdaddr_t *addr,
-		unsigned int flags,
+		unsigned int profile,
+		unsigned int modes,
 		struct ba_pcm *pcm,
 		DBusError *error);
 
-dbus_bool_t bluealsa_dbus_pcm_open(
+dbus_bool_t bluealsa_dbus_open_pcm(
 		struct ba_dbus_ctx *ctx,
 		const char *pcm_path,
-		int operation_mode,
 		int *fd_pcm,
 		int *fd_pcm_ctrl,
 		DBusError *error);
 
-dbus_bool_t bluealsa_dbus_rfcomm_open(
+dbus_bool_t bluealsa_dbus_open_rfcomm(
 		struct ba_dbus_ctx *ctx,
 		const char *rfcomm_path,
 		int *fd_rfcomm,
+		DBusError *error);
+
+dbus_bool_t bluealsa_dbus_pcm_update(
+		struct ba_dbus_ctx *ctx,
+		const struct ba_pcm *pcm,
+		enum ba_pcm_property property,
 		DBusError *error);
 
 dbus_bool_t bluealsa_dbus_pcm_ctrl_send(

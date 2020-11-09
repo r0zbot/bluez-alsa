@@ -1,6 +1,6 @@
 /*
  * bluealsa-pcm.c
- * Copyright (c) 2016-2019 Arkadiusz Bokowy
+ * Copyright (c) 2016-2020 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -25,6 +25,7 @@
 #include <strings.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <alsa/asoundlib.h>
@@ -37,12 +38,18 @@
 #include "shared/log.h"
 #include "shared/rt.h"
 
+#define BA_PAUSE_STATE_RUNNING 0
+#define BA_PAUSE_STATE_PAUSED  (1 << 0)
+#define BA_PAUSE_STATE_PENDING (1 << 1)
 
 struct bluealsa_pcm {
 	snd_pcm_ioplug_t io;
 
 	/* D-Bus connection context */
 	struct ba_dbus_ctx dbus_ctx;
+
+	/* IO thread and application thread sync */
+	pthread_mutex_t mutex;
 
 	/* requested BlueALSA PCM */
 	struct ba_pcm ba_pcm;
@@ -54,27 +61,39 @@ struct bluealsa_pcm {
 	int event_fd;
 
 	/* virtual hardware - ring buffer */
-	snd_pcm_uframes_t io_ptr;
+	char *io_hw_buffer;
+	/* The IO thread is responsible for maintaining the hardware pointer
+	 * (pcm->io_hw_ptr), the application is responsible for the application
+	 * pointer (io->appl_ptr). These are both volatile as they are both
+	 * written in one thread and read in the other. */
+	volatile snd_pcm_sframes_t io_hw_ptr;
+	snd_pcm_uframes_t io_hw_boundary;
+	/* Permit the application to modify the frequency of poll() events. */
+	volatile snd_pcm_uframes_t io_avail_min;
 	pthread_t io_thread;
 	bool io_started;
-
-	/* communication and encoding/decoding delay */
-	snd_pcm_sframes_t delay;
-	/* user provided extra delay component */
-	snd_pcm_sframes_t delay_ex;
 
 	/* ALSA operates on frames, we on bytes */
 	size_t frame_size;
 
-	/* In order to see whether the PCM has reached under-run (or over-run), we
-	 * have to know the exact position of the hardware and software pointers.
-	 * To do so, we could use the HW pointer provided by the IO plug structure.
-	 * This pointer is updated by the snd_pcm_hwsync() function, which is not
-	 * thread-safe (total disaster is guaranteed). Since we can not call this
-	 * function, we are going to use our own HW pointer, which can be updated
-	 * safely in our IO thread. */
-	snd_pcm_uframes_t io_hw_boundary;
-	snd_pcm_uframes_t io_hw_ptr;
+	struct timespec delay_ts;
+	snd_pcm_uframes_t delay_hw_ptr;
+	unsigned int delay_pcm_nread;
+	/* In the capture mode, delay_running indicates that frames are being
+	 * transfered to the FIFO by the server. In playback mode it indicates
+	 * that the IO thread is transferring frames to the FIFO. */
+	bool delay_running;
+
+	/* delay accumulated just before pausing */
+	snd_pcm_sframes_t delay_paused;
+	/* maximum delay in FIFO */
+	snd_pcm_sframes_t delay_fifo_size;
+	/* user provided extra delay component */
+	snd_pcm_sframes_t delay_ex;
+
+	/* synchronize threads to begin/end pause */
+	pthread_cond_t pause_cond;
+	unsigned int pause_state;
 
 };
 
@@ -83,10 +102,31 @@ struct bluealsa_pcm {
 #define debug2(M, ...) \
 	debug("%s: " M, pcm->ba_pcm.pcm_path, ## __VA_ARGS__)
 
+#if SND_LIB_VERSION < 0x010106
+/**
+ * Get the available frames.
+ *
+ * This function is available in alsa-lib since version 1.1.6. For older
+ * alsa-lib versions we need to provide our own implementation. */
+static snd_pcm_uframes_t snd_pcm_ioplug_hw_avail(const snd_pcm_ioplug_t * const io,
+		const snd_pcm_uframes_t hw_ptr, const snd_pcm_uframes_t appl_ptr) {
+	struct bluealsa_pcm *pcm = io->private_data;
+	snd_pcm_sframes_t diff;
+	if (io->stream == SND_PCM_STREAM_PLAYBACK)
+		diff = appl_ptr - hw_ptr;
+	else
+		diff = io->buffer_size - hw_ptr + appl_ptr;
+	if (diff < 0)
+		diff += pcm->io_hw_boundary;
+	return diff <= io->buffer_size ? (snd_pcm_uframes_t) diff : 0;
+}
+#endif
+
 /**
  * Helper function for closing PCM transport. */
 static int close_transport(struct bluealsa_pcm *pcm) {
 	int rv = 0;
+	pthread_mutex_lock(&pcm->mutex);
 	if (pcm->ba_pcm_fd != -1) {
 		rv |= close(pcm->ba_pcm_fd);
 		pcm->ba_pcm_fd = -1;
@@ -95,6 +135,7 @@ static int close_transport(struct bluealsa_pcm *pcm) {
 		rv |= close(pcm->ba_pcm_ctrl_fd);
 		pcm->ba_pcm_ctrl_fd = -1;
 	}
+	pthread_mutex_unlock(&pcm->mutex);
 	return rv;
 }
 
@@ -106,9 +147,39 @@ static void io_thread_cleanup(struct bluealsa_pcm *pcm) {
 }
 
 /**
+ * Helper function for IO thread delay calculation. */
+static void io_thread_update_delay(struct bluealsa_pcm *pcm,
+		snd_pcm_sframes_t hw_ptr) {
+
+	struct timespec now;
+	unsigned int nread = 0;
+
+	gettimestamp(&now);
+	ioctl(pcm->ba_pcm_fd, FIONREAD, &nread);
+
+	pthread_mutex_lock(&pcm->mutex);
+
+	/* stash current time and levels */
+	pcm->delay_ts = now;
+	pcm->delay_pcm_nread = nread;
+	if (hw_ptr == -1) {
+		pcm->delay_hw_ptr = 0;
+		if (pcm->io.stream == SND_PCM_STREAM_PLAYBACK)
+			pcm->delay_running = false;
+	}
+	else {
+		pcm->delay_hw_ptr = hw_ptr;
+		if (pcm->io.stream == SND_PCM_STREAM_PLAYBACK)
+			pcm->delay_running = true;
+	}
+
+	pthread_mutex_unlock(&pcm->mutex);
+
+}
+
+/**
  * IO thread, which facilitates ring buffer. */
-static void *io_thread(void *arg) {
-	snd_pcm_ioplug_t *io = (snd_pcm_ioplug_t *)arg;
+static void *io_thread(snd_pcm_ioplug_t *io) {
 
 	struct bluealsa_pcm *pcm = io->private_data;
 	pthread_cleanup_push(PTHREAD_CLEANUP(io_thread_cleanup), pcm);
@@ -131,52 +202,86 @@ static void *io_thread(void *arg) {
 	struct asrsync asrs;
 	asrsync_init(&asrs, io->rate);
 
+	/* We update pcm->io_hw_ptr (i.e. the value seen by ioplug) only when
+	 * a period has been completed. We use a temporary copy during the
+	 * transfer procedure. */
+	snd_pcm_uframes_t io_hw_ptr = pcm->io_hw_ptr;
+
+	/* The number of frames to complete the current period. */
+	snd_pcm_uframes_t balance = io->period_size;
+
 	debug2("Starting IO loop: %d", pcm->ba_pcm_fd);
 	for (;;) {
 
-		int tmp;
-		switch (io->state) {
-		case SND_PCM_STATE_RUNNING:
-		case SND_PCM_STATE_DRAINING:
-			break;
-		case SND_PCM_STATE_DISCONNECTED:
-			goto fail;
-		default:
-			debug2("IO thread paused: %d", io->state);
+		if (pcm->pause_state & BA_PAUSE_STATE_PENDING ||
+				pcm->io_hw_ptr == -1) {
+			debug2("Pausing IO thread: %ld", pcm->io_hw_ptr);
+
+			pthread_mutex_lock(&pcm->mutex);
+			pcm->pause_state = BA_PAUSE_STATE_PAUSED;
+			pthread_cond_signal(&pcm->pause_cond);
+			pthread_mutex_unlock(&pcm->mutex);
+
+			int tmp;
 			sigwait(&sigset, &tmp);
+
+			pthread_mutex_lock(&pcm->mutex);
+			pcm->pause_state = BA_PAUSE_STATE_RUNNING;
+			pthread_mutex_unlock(&pcm->mutex);
+
+			debug2("IO thread resumed");
+
+			if (pcm->io_hw_ptr == -1)
+				continue;
+			if (pcm->ba_pcm_fd == -1)
+				goto fail;
+
 			asrsync_init(&asrs, io->rate);
-			debug2("IO thread resumed: %d", io->state);
+			io_hw_ptr = io->hw_ptr;
+
 		}
 
-		snd_pcm_uframes_t io_ptr = pcm->io_ptr;
-		snd_pcm_uframes_t io_buffer_size = io->buffer_size;
-		snd_pcm_uframes_t io_hw_ptr = pcm->io_hw_ptr;
-		snd_pcm_uframes_t io_hw_boundary = pcm->io_hw_boundary;
-		snd_pcm_uframes_t frames = io->period_size;
-		const snd_pcm_channel_area_t *areas = snd_pcm_ioplug_mmap_areas(io);
-		char *buffer = (char *)areas->addr + (areas->first + areas->step * io_ptr) / 8;
-		char *head = buffer;
-		ssize_t ret = 0;
-		size_t len;
+		if (io->state == SND_PCM_STATE_DISCONNECTED)
+			goto fail;
+
+		/* There are 2 reasons why the number of available frames may be
+		 * zero: XRUN or drained final samples; we set the HW pointer to
+		 * -1 to indicate we have no work to do. */
+		snd_pcm_uframes_t avail;
+		if ((avail = snd_pcm_ioplug_hw_avail(io, io_hw_ptr, io->appl_ptr)) == 0) {
+			io_thread_update_delay(pcm, 0);
+			io_hw_ptr = -1;
+			goto sync;
+		}
+
+		/* the number of frames to be transferred in this iteration */
+		snd_pcm_uframes_t frames = balance;
+		/* current offset of the head pointer in the IO buffer */
+		snd_pcm_uframes_t offset = io_hw_ptr % io->buffer_size;
+
+		/* Do not try to transfer more frames than are available in the ring
+		 * buffer! */
+		if (frames > avail)
+			frames = avail;
 
 		/* If the leftover in the buffer is less than a whole period sizes,
 		 * adjust the number of frames which should be transfered. It has
 		 * turned out, that the buffer might contain fractional number of
 		 * periods - it could be an ALSA bug, though, it has to be handled. */
-		if (io_buffer_size - io_ptr < frames)
-			frames = io_buffer_size - io_ptr;
+		if (io->buffer_size - offset < frames)
+			frames = io->buffer_size - offset;
 
 		/* IO operation size in bytes */
-		len = frames * pcm->frame_size;
+		size_t len = frames * pcm->frame_size;
+		char *head = pcm->io_hw_buffer + offset * pcm->frame_size;
 
-		io_ptr += frames;
-		if (io_ptr >= io_buffer_size)
-			io_ptr -= io_buffer_size;
-
+		/* Increment the HW pointer (with boundary wrap) ready for the next
+		 * iteration. */
 		io_hw_ptr += frames;
-		if (io_hw_ptr >= io_hw_boundary)
-			io_hw_ptr -= io_hw_boundary;
+		if (io_hw_ptr >= pcm->io_hw_boundary)
+			io_hw_ptr -= pcm->io_hw_boundary;
 
+		ssize_t ret = 0;
 		if (io->stream == SND_PCM_STREAM_CAPTURE) {
 
 			/* Read the whole period "atomically". This will assure, that frames
@@ -195,36 +300,46 @@ static void *io_thread(void *arg) {
 			if (ret == 0)
 				goto fail;
 
+			io_thread_update_delay(pcm, io_hw_ptr);
+
 		}
 		else {
-
-			/* check for under-run and act accordingly */
-			if (io_hw_ptr > io->appl_ptr) {
-				io->state = SND_PCM_STATE_XRUN;
-				io_ptr = -1;
-				goto sync;
-			}
 
 			/* Perform atomic write - see the explanation above. */
 			do {
 				if ((ret = write(pcm->ba_pcm_fd, head, len)) == -1) {
 					if (errno == EINTR)
 						continue;
-					SNDERR("PCM FIFO write error: %s", strerror(errno));
+					if (errno != EPIPE)
+						SNDERR("PCM FIFO write error: %s", strerror(errno));
 					goto fail;
 				}
 				head += ret;
 				len -= ret;
 			} while (len != 0);
 
+			io_thread_update_delay(pcm, io_hw_ptr);
+
 			/* synchronize playback time */
 			asrsync_sync(&asrs, frames);
+
 		}
 
+		/* repeat until period is completed */
+		balance -= frames;
+		if (balance > 0)
+			continue;
+
 sync:
-		pcm->io_ptr = io_ptr;
+		/* Make the new HW pointer value visible to the ioplug. */
 		pcm->io_hw_ptr = io_hw_ptr;
+
+		/* Generate poll() event so application is made aware of
+		 * the HW pointer change. */
 		eventfd_write(pcm->event_fd, 1);
+
+		/* Start the next period. */
+		balance = io->period_size;
 	}
 
 fail:
@@ -232,6 +347,7 @@ fail:
 	pthread_cleanup_pop(1);
 	close_transport(pcm);
 	eventfd_write(pcm->event_fd, 0xDEAD0000);
+	pthread_cond_signal(&pcm->pause_cond);
 	return NULL;
 }
 
@@ -243,31 +359,27 @@ static int bluealsa_start(snd_pcm_ioplug_t *io) {
 	 * we might end up with a bunch of IO threads reading or writing to the
 	 * same FIFO simultaneously. Instead, just send resume signal. */
 	if (pcm->io_started) {
-		io->state = SND_PCM_STATE_RUNNING;
 		pthread_kill(pcm->io_thread, SIGIO);
 		return 0;
 	}
-
-	/* initialize delay calculation */
-	pcm->delay = 0;
 
 	if (!bluealsa_dbus_pcm_ctrl_send_resume(pcm->ba_pcm_ctrl_fd, NULL)) {
 		debug2("Couldn't start PCM: %s", strerror(errno));
 		return -errno;
 	}
 
-	/* State has to be updated before the IO thread is created - if the state
-	 * does not indicate "running", the IO thread will be suspended until the
-	 * "resume" signal is delivered. This requirement is only (?) theoretical,
-	 * anyhow forewarned is forearmed. */
-	snd_pcm_state_t prev_state = io->state;
-	io->state = SND_PCM_STATE_RUNNING;
+	/* Initialize delay calculation - capture reception begins immediately,
+	 * playback transmission begins only when first period has been written
+	 * by the application. */
+	pcm->delay_running = io->stream == SND_PCM_STREAM_CAPTURE ? true : false;
+	gettimestamp(&pcm->delay_ts);
 
+	/* start the IO thread */
 	pcm->io_started = true;
-	if ((errno = pthread_create(&pcm->io_thread, NULL, io_thread, io)) != 0) {
+	if ((errno = pthread_create(&pcm->io_thread, NULL,
+					PTHREAD_ROUTINE(io_thread), io)) != 0) {
 		debug2("Couldn't create IO thread: %s", strerror(errno));
 		pcm->io_started = false;
-		io->state = prev_state;
 		return -errno;
 	}
 
@@ -285,13 +397,19 @@ static int bluealsa_stop(snd_pcm_ioplug_t *io) {
 		pthread_join(pcm->io_thread, NULL);
 	}
 
+	pcm->delay_running = false;
+	pcm->delay_pcm_nread = 0;
+
+	/* Bug in ioplug - if pcm->io_hw_ptr == -1 then it reports state
+	 * SND_PCM_STATE_XRUN instead of SND_PCM_STATE_SETUP after PCM
+	 * was stopped. */
+	pcm->io_hw_ptr = 0;
+
 	if (!bluealsa_dbus_pcm_ctrl_send_drop(pcm->ba_pcm_ctrl_fd, NULL))
 		return -errno;
 
-	/* Although the pcm stream is now stopped, it is still prepared and
-	 * therefore an application that uses start_threshold may try to restart it
-	 * by simply performing an I/O operation. If such an application now calls
-	 * poll() it may be blocked forever unless we generate an event here. */
+	/* Applications that call poll() after snd_pcm_drain() will be blocked
+	 * forever unless we generate a poll() event here. */
 	eventfd_write(pcm->event_fd, 1);
 
 	return 0;
@@ -301,7 +419,11 @@ static snd_pcm_sframes_t bluealsa_pointer(snd_pcm_ioplug_t *io) {
 	struct bluealsa_pcm *pcm = io->private_data;
 	if (pcm->ba_pcm_fd == -1)
 		return -ENODEV;
-	return pcm->io_ptr;
+#ifndef SND_PCM_IOPLUG_FLAG_BOUNDARY_WA
+	if (pcm->io_hw_ptr != -1)
+		return pcm->io_hw_ptr % io->buffer_size;
+#endif
+	return pcm->io_hw_ptr;
 }
 
 static int bluealsa_close(snd_pcm_ioplug_t *io) {
@@ -309,6 +431,8 @@ static int bluealsa_close(snd_pcm_ioplug_t *io) {
 	debug2("Closing");
 	bluealsa_dbus_connection_ctx_free(&pcm->dbus_ctx);
 	close(pcm->event_fd);
+	pthread_mutex_destroy(&pcm->mutex);
+	pthread_cond_destroy(&pcm->pause_cond);
 	free(pcm);
 	return 0;
 }
@@ -321,30 +445,28 @@ static int bluealsa_hw_params(snd_pcm_ioplug_t *io, snd_pcm_hw_params_t *params)
 	pcm->frame_size = (snd_pcm_format_physical_width(io->format) * io->channels) / 8;
 
 	DBusError err = DBUS_ERROR_INIT;
-	if (!bluealsa_dbus_pcm_open(&pcm->dbus_ctx, pcm->ba_pcm.pcm_path,
-				io->stream == SND_PCM_STREAM_PLAYBACK ? BA_PCM_FLAG_SOURCE : BA_PCM_FLAG_SINK,
+	if (!bluealsa_dbus_open_pcm(&pcm->dbus_ctx, pcm->ba_pcm.pcm_path,
 				&pcm->ba_pcm_fd, &pcm->ba_pcm_ctrl_fd, &err)) {
 		debug2("Couldn't open PCM: %s", err.message);
 		dbus_error_free(&err);
 		return -EBUSY;
 	}
 
-	/* Indicate that our PCM is ready for writing, even though is is not 100%
-	 * true - IO thread is not running yet. Some weird implementations might
-	 * require PCM to be writable before the snd_pcm_start() call. */
-	if (io->stream == SND_PCM_STREAM_PLAYBACK)
-		eventfd_write(pcm->event_fd, 1);
-
-	if (pcm->io.stream == SND_PCM_STREAM_PLAYBACK) {
+	if (pcm->io.stream == SND_PCM_STREAM_PLAYBACK)
 		/* By default, the size of the pipe buffer is set to a too large value for
 		 * our purpose. On modern Linux system it is 65536 bytes. Large buffer in
 		 * the playback mode might contribute to an unnecessary audio delay. Since
 		 * it is possible to modify the size of this buffer we will set is to some
 		 * low value, but big enough to prevent audio tearing. Note, that the size
 		 * will be rounded up to the page size (typically 4096 bytes). */
-		pcm->ba_pcm_buffer_size = fcntl(pcm->ba_pcm_fd, F_SETPIPE_SZ, 2048);
-		debug2("FIFO buffer size: %zd", pcm->ba_pcm_buffer_size);
-	}
+		pcm->delay_fifo_size = fcntl(pcm->ba_pcm_fd, F_SETPIPE_SZ, 2048) / pcm->frame_size;
+	else
+		pcm->delay_fifo_size = fcntl(pcm->ba_pcm_fd, F_GETPIPE_SZ)  / pcm->frame_size;
+
+	debug2("FIFO buffer size: %zd frames", pcm->delay_fifo_size);
+
+	/* ALSA default for avail min is one period. */
+	pcm->io_avail_min = io->period_size;
 
 	debug2("Selected HW buffer: %zd periods x %zd bytes %c= %zd bytes",
 			io->buffer_size / io->period_size, pcm->frame_size * io->period_size,
@@ -365,7 +487,16 @@ static int bluealsa_hw_free(snd_pcm_ioplug_t *io) {
 static int bluealsa_sw_params(snd_pcm_ioplug_t *io, snd_pcm_sw_params_t *params) {
 	struct bluealsa_pcm *pcm = io->private_data;
 	debug2("Initializing SW");
+
 	snd_pcm_sw_params_get_boundary(params, &pcm->io_hw_boundary);
+
+	snd_pcm_uframes_t avail_min;
+	snd_pcm_sw_params_get_avail_min(params, &avail_min);
+	if (avail_min != pcm->io_avail_min) {
+		debug2("Changing SW avail min: %zu -> %zu", pcm->io_avail_min, avail_min);
+		pcm->io_avail_min = avail_min;
+	}
+
 	return 0;
 }
 
@@ -378,11 +509,17 @@ static int bluealsa_prepare(snd_pcm_ioplug_t *io) {
 
 	/* initialize ring buffer */
 	pcm->io_hw_ptr = 0;
-	pcm->io_ptr = 0;
 
-	/* Indicate that our PCM is ready for i/o, even though is is not 100%
-	 * true - the IO thread is not running yet. Applications using
-	 * snd_pcm_sw_params_set_start_threshold() require PCM to be usable
+	/* The ioplug allocates and configures its channel area buffer when the
+	 * HW parameters are fixed, but after calling bluealsa_hw_params(). So,
+	 * this is the earliest opportunity for us to safely cache the ring
+	 * buffer start address. */
+	const snd_pcm_channel_area_t *areas = snd_pcm_ioplug_mmap_areas(io);
+	pcm->io_hw_buffer = (char *)areas->addr + areas->first / 8;
+
+	/* Indicate that our PCM is ready for IO, even though is is not 100%
+	 * true - the IO thread may not be running yet. Applications using
+	 * snd_pcm_sw_params_set_start_threshold() require the PCM to be usable
 	 * as soon as it has been prepared. */
 	eventfd_write(pcm->event_fd, 1);
 
@@ -392,22 +529,119 @@ static int bluealsa_prepare(snd_pcm_ioplug_t *io) {
 
 static int bluealsa_drain(snd_pcm_ioplug_t *io) {
 	struct bluealsa_pcm *pcm = io->private_data;
-	if (!bluealsa_dbus_pcm_ctrl_send_drain(pcm->ba_pcm_ctrl_fd, NULL))
-		return -errno;
+	bluealsa_dbus_pcm_ctrl_send_drain(pcm->ba_pcm_ctrl_fd, NULL);
+	/* We cannot recover from an error here. By returning zero we ensure that
+	 * ioplug stops the pcm. Returning an error code would be interpreted by
+	 * ioplug as an incomplete drain and would it leave the pcm running. */
 	return 0;
+}
+
+/**
+ * Calculate overall PCM delay.
+ *
+ * Exact calculation of the PCM delay is very hard, if not impossible. For
+ * the sake of simplicity we will make few assumptions and approximations.
+ * In general, the delay is proportional to the number of bytes queued in
+ * the FIFO buffer, the time required to encode data, Bluetooth transfer
+ * latency and the time required by the device to decode and play audio. */
+static snd_pcm_sframes_t bluealsa_calculate_delay(snd_pcm_ioplug_t *io) {
+	struct bluealsa_pcm *pcm = io->private_data;
+
+	snd_pcm_sframes_t delay = 0;
+
+	/* if PCM is not started there should be no capture delay */
+	if (!pcm->delay_running && io->stream == SND_PCM_STREAM_CAPTURE)
+		return 0;
+
+	struct timespec now;
+	gettimestamp(&now);
+
+	pthread_mutex_lock(&pcm->mutex);
+
+	struct timespec diff;
+	difftimespec(&now, &pcm->delay_ts, &diff);
+
+	/* the maximum number of frames that can have been
+	 * produced/consumed by the server since pcm->delay_ts */
+	unsigned int tframes =
+		(diff.tv_sec * 1000 + diff.tv_nsec / 1000000) * io->rate / 1000;
+
+	/* the number of frames that were in the FIFO at pcm->delay_ts */
+	snd_pcm_uframes_t fifo_delay = pcm->delay_pcm_nread / pcm->frame_size;
+
+	if (io->stream == SND_PCM_STREAM_CAPTURE) {
+
+		/* Start with maximum frames available in FIFO since pcm->delay_ts. */
+		delay = fifo_delay + tframes;
+
+		/* Adjust by the change in frames in the buffer. */
+		if (io->state != SND_PCM_STATE_XRUN)
+			delay += io->buffer_size - snd_pcm_ioplug_hw_avail(io, pcm->delay_hw_ptr, io->appl_ptr);
+
+		/* impose upper limit */
+		snd_pcm_sframes_t limit = pcm->delay_fifo_size + io->buffer_size;
+		if (delay > limit)
+			delay = limit;
+
+	}
+	else {
+
+		delay = fifo_delay;
+
+		/* The buffer_delay is the number of frames that were in the buffer at
+		 * pcm->delay_ts, adjusted the number written by the application since
+		 * then. */
+		snd_pcm_sframes_t buffer_delay = 0;
+		if (io->state != SND_PCM_STATE_XRUN)
+			buffer_delay = snd_pcm_ioplug_hw_avail(io, pcm->delay_hw_ptr, io->appl_ptr);
+
+		/* If the PCM is running, then some frames from the buffer may have been
+		 * consumed. */
+		if (pcm->delay_running)
+			delay += buffer_delay;
+
+		/* Adjust the total delay by the number of frames consumed. */
+		if ((delay -= tframes) < 0)
+			delay = 0;
+
+		/* If the PCM is not running, then the frames in the buffer will not have
+		 * been consumed since pcm->delay_ts. */
+		if (!pcm->delay_running)
+			delay += buffer_delay;
+	}
+
+	pthread_mutex_unlock(&pcm->mutex);
+
+	/* data transfer (communication) and encoding/decoding */
+	delay += (io->rate / 100) * pcm->ba_pcm.delay / 100;
+
+	delay += pcm->delay_ex;
+
+	return delay;
 }
 
 static int bluealsa_pause(snd_pcm_ioplug_t *io, int enable) {
 	struct bluealsa_pcm *pcm = io->private_data;
 
+	if (enable == 1) {
+		/* Synchronize the IO thread with an application thread to ensure that
+		 * the server will not be paused while we are processing a transfer. */
+		pthread_mutex_lock(&pcm->mutex);
+		pcm->pause_state |= BA_PAUSE_STATE_PENDING;
+		while (!(pcm->pause_state & BA_PAUSE_STATE_PAUSED) && pcm->ba_pcm_fd != -1)
+			pthread_cond_wait(&pcm->pause_cond, &pcm->mutex);
+		pthread_mutex_unlock(&pcm->mutex);
+	}
+
 	if (!bluealsa_dbus_pcm_ctrl_send(pcm->ba_pcm_ctrl_fd,
 				enable ? "Pause" : "Resume", NULL))
 		return -errno;
 
-	if (enable == 0) {
-		io->state = SND_PCM_STATE_RUNNING;
+	if (enable == 0)
 		pthread_kill(pcm->io_thread, SIGIO);
-	}
+	else
+		/* store current delay value */
+		pcm->delay_paused = bluealsa_calculate_delay(io);
 
 	/* Even though PCM transport is paused, our IO thread is still running. If
 	 * the implementer relies on the PCM file descriptor readiness, we have to
@@ -422,7 +656,14 @@ static void bluealsa_dump(snd_pcm_ioplug_t *io, snd_output_t *out) {
 	struct bluealsa_pcm *pcm = io->private_data;
 	snd_output_printf(out, "BlueALSA PCM: %s\n", pcm->ba_pcm.pcm_path);
 	snd_output_printf(out, "BlueALSA BlueZ device: %s\n", pcm->ba_pcm.device_path);
-	snd_output_printf(out, "BlueALSA Bluetooth codec: %#x\n", pcm->ba_pcm.codec);
+	snd_output_printf(out, "BlueALSA Bluetooth codec: %s\n", pcm->ba_pcm.codec);
+	/* alsa-lib commits the PCM setup only if bluealsa_hw_params() returned
+	 * success, so we only dump the ALSA PCM parameters if the BlueALSA PCM
+	 * connection is established. */
+	if (pcm->ba_pcm_fd >= 0) {
+		snd_output_printf(out, "Its setup is:\n");
+		snd_pcm_dump_setup(io->pcm, out);
+	}
 }
 
 static int bluealsa_delay(snd_pcm_ioplug_t *io, snd_pcm_sframes_t *delayp) {
@@ -431,27 +672,32 @@ static int bluealsa_delay(snd_pcm_ioplug_t *io, snd_pcm_sframes_t *delayp) {
 	if (pcm->ba_pcm_fd == -1)
 		return -ENODEV;
 
-	/* Exact calculation of the PCM delay is very hard, if not impossible. For
-	 * the sake of simplicity we will make few assumptions and approximations.
-	 * In general, the delay is proportional to the number of bytes queued in
-	 * the FIFO buffer, the time required to encode data, Bluetooth transfer
-	 * latency and the time required by the device to decode and play audio. */
+	int ret = 0;
+	*delayp = 0;
 
-	snd_pcm_sframes_t delay = 0;
-	unsigned int size;
+	switch (io->state) {
+		case SND_PCM_STATE_PREPARED:
+		case SND_PCM_STATE_RUNNING:
+			*delayp = bluealsa_calculate_delay(io);
+			break;
+		case SND_PCM_STATE_PAUSED:
+			*delayp = pcm->delay_paused;
+			break;
+		case SND_PCM_STATE_XRUN:
+			*delayp = bluealsa_calculate_delay(io);
+			ret = -EPIPE;
+			break;
+		case SND_PCM_STATE_SUSPENDED:
+			ret = -ESTRPIPE;
+			break;
+		case SND_PCM_STATE_DISCONNECTED:
+			ret = -ENODEV;
+			break;
+		default:
+			break;
+	}
 
-	/* bytes queued in the PCM ring buffer */
-	delay += io->appl_ptr - io->hw_ptr;
-
-	/* bytes queued in the FIFO buffer */
-	if (ioctl(pcm->ba_pcm_fd, FIONREAD, &size) != -1)
-		delay += size / pcm->frame_size;
-
-	/* data transfer (communication) and encoding/decoding */
-	pcm->delay = (io->rate / 100) * pcm->ba_pcm.delay / 100;
-
-	*delayp = delay + pcm->delay + pcm->delay_ex;
-	return 0;
+	return ret;
 }
 
 static int bluealsa_poll_descriptors_count(snd_pcm_ioplug_t *io) {
@@ -482,12 +728,15 @@ static int bluealsa_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfd,
 		unsigned int nfds, unsigned short *revents) {
 	struct bluealsa_pcm *pcm = io->private_data;
 
+	*revents = 0;
+	int ret = 0;
+
 	if (bluealsa_dbus_connection_poll_dispatch(&pcm->dbus_ctx, &pfd[1], nfds - 1))
 		while (dbus_connection_dispatch(pcm->dbus_ctx.conn) == DBUS_DISPATCH_DATA_REMAINS)
 			continue;
 
 	if (pcm->ba_pcm_fd == -1)
-		return -ENODEV;
+		goto fail;
 
 	if (pfd[0].revents & POLLIN) {
 
@@ -497,36 +746,59 @@ static int bluealsa_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfd,
 		if (event & 0xDEAD0000)
 			goto fail;
 
+		/* This call synchronizes the ring buffer pointers and updates the
+		 * ioplug state. */
+		snd_pcm_sframes_t avail = snd_pcm_avail(io->pcm);
+
 		/* ALSA expects that the event will match stream direction, e.g.
 		 * playback will not start if the event is for reading. */
 		*revents = io->stream == SND_PCM_STREAM_CAPTURE ? POLLIN : POLLOUT;
 
-		/* Include POLLERR if PCM is not prepared, running or draining.
-		 * Also restore the event trigger as in this state the io thread is
-		 * not active to do it */
-		if (io->state != SND_PCM_STATE_PREPARED &&
-			 io->state != SND_PCM_STATE_RUNNING &&
-			 io->state != SND_PCM_STATE_DRAINING) {
-			*revents |= POLLERR;
-			eventfd_write(pcm->event_fd, 1);
-		}
+		/* We hold the event fd ready, unless insufficient frames are
+		 * available in the ring buffer. */
+		bool ready = true;
 
-		/* a playback application may write less than start_threshold frames on
-		 * its first write and then wait in poll() forever because the event_fd
-		 * never gets written to again.
-		 * To prevent this possibility, we bump the internal trigger. */
-		else if (snd_pcm_stream(io->pcm) == SND_PCM_STREAM_PLAYBACK &&
-			io->state == SND_PCM_STATE_PREPARED)
+		switch (io->state) {
+			case SND_PCM_STATE_SETUP:
+				ready = false;
+				*revents = 0;
+				break;
+			case SND_PCM_STATE_PREPARED:
+				/* capture poll should block forever */
+				if (io->stream == SND_PCM_STREAM_CAPTURE) {
+					ready = false;
+					*revents = 0;
+				}
+				break;
+			case SND_PCM_STATE_RUNNING:
+				if ((snd_pcm_uframes_t)avail < pcm->io_avail_min) {
+					ready = false;
+					*revents = 0;
+				}
+				break;
+			case SND_PCM_STATE_XRUN:
+			case SND_PCM_STATE_PAUSED:
+			case SND_PCM_STATE_SUSPENDED:
+				*revents |= POLLERR;
+				break;
+			case SND_PCM_STATE_DISCONNECTED:
+				*revents = POLLERR;
+				ret = -ENODEV;
+				break;
+			case SND_PCM_STATE_OPEN:
+				*revents = POLLERR;
+				ret = -EBADF;
+				break;
+			default:
+				break;
+		};
+
+		if (ready)
 			eventfd_write(pcm->event_fd, 1);
 
-		/* If the event was triggered prematurely, wait for another one. */
-		else if (!snd_pcm_avail_update(io->pcm))
-			*revents = 0;
 	}
-	else
-		*revents = 0;
 
-	return 0;
+	return ret;
 
 fail:
 	*revents = POLLERR | POLLHUP;
@@ -567,10 +839,28 @@ static int str2bdaddr(const char *str, bdaddr_t *ba) {
 
 static int str2profile(const char *str) {
 	if (strcasecmp(str, "a2dp") == 0)
-		return BA_PCM_FLAG_PROFILE_A2DP;
+		return BA_PCM_PROFILE_A2DP;
 	else if (strcasecmp(str, "sco") == 0)
-		return BA_PCM_FLAG_PROFILE_SCO;
+		return BA_PCM_PROFILE_SCO;
 	return 0;
+}
+
+static snd_pcm_format_t get_snd_pcm_format(uint16_t format) {
+	switch (format) {
+	case 0x0108:
+		return SND_PCM_FORMAT_U8;
+	case 0x8210:
+		return SND_PCM_FORMAT_S16_LE;
+	case 0x8318:
+		return SND_PCM_FORMAT_S24_3LE;
+	case 0x8418:
+		return SND_PCM_FORMAT_S24_LE;
+	case 0x8420:
+		return SND_PCM_FORMAT_S32_LE;
+	default:
+		SNDERR("Unknown PCM format: %#x", format);
+		return SND_PCM_FORMAT_UNKNOWN;
+	}
 }
 
 static int bluealsa_set_hw_constraint(struct bluealsa_pcm *pcm) {
@@ -579,9 +869,6 @@ static int bluealsa_set_hw_constraint(struct bluealsa_pcm *pcm) {
 	static const snd_pcm_access_t accesses[] = {
 		SND_PCM_ACCESS_MMAP_INTERLEAVED,
 		SND_PCM_ACCESS_RW_INTERLEAVED,
-	};
-	static const unsigned int formats[] = {
-		SND_PCM_FORMAT_S16_LE,
 	};
 
 	int err;
@@ -592,6 +879,7 @@ static int bluealsa_set_hw_constraint(struct bluealsa_pcm *pcm) {
 					ARRAYSIZE(accesses), accesses)) < 0)
 		return err;
 
+	unsigned int formats[] = { get_snd_pcm_format(pcm->ba_pcm.format) };
 	if ((err = snd_pcm_ioplug_set_param_list(io, SND_PCM_IOPLUG_HW_FORMAT,
 					ARRAYSIZE(formats), formats)) < 0)
 		return err;
@@ -601,19 +889,15 @@ static int bluealsa_set_hw_constraint(struct bluealsa_pcm *pcm) {
 		return err;
 
 	/* In order to prevent audio tearing and minimize CPU utilization, we're
-	 * going to setup buffer size constraints. These limits are derived from
-	 * the transport sampling rate and the number of channels, so the buffer
-	 * "time" size will be constant. The minimal period size and buffer size
-	 * are respectively 10 ms and 200 ms. Upper limits are not constraint. */
-	unsigned int min_p = pcm->ba_pcm.sampling * 10 / 1000 * pcm->ba_pcm.channels * 2;
-	unsigned int min_b = pcm->ba_pcm.sampling * 200 / 1000 * pcm->ba_pcm.channels * 2;
+	 * going to setup period size constraint. The limit is derived from the
+	 * transport sampling rate and the number of channels, so the period
+	 * "time" size will be constant, and should be about 10ms. The upper
+	 * limit will not be constrained. */
+	unsigned int min_p = pcm->ba_pcm.sampling / 100 * pcm->ba_pcm.channels *
+		snd_pcm_format_physical_width(get_snd_pcm_format(pcm->ba_pcm.format)) / 8;
 
 	if ((err = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_PERIOD_BYTES,
 					min_p, 1024 * 16)) < 0)
-		return err;
-
-	if ((err = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_BUFFER_BYTES,
-					min_b, 1024 * 1024 * 16)) < 0)
 		return err;
 
 	if ((err = snd_pcm_ioplug_set_param_minmax(io, SND_PCM_IOPLUG_HW_CHANNELS,
@@ -702,6 +986,9 @@ SND_PCM_PLUGIN_DEFINE_FUNC(bluealsa) {
 	pcm->ba_pcm_fd = -1;
 	pcm->ba_pcm_ctrl_fd = -1;
 	pcm->delay_ex = delay;
+	pthread_mutex_init(&pcm->mutex, NULL);
+	pthread_cond_init(&pcm->pause_cond, NULL);
+	pcm->pause_state = BA_PAUSE_STATE_RUNNING;
 
 	dbus_threads_init_default();
 
@@ -712,9 +999,10 @@ SND_PCM_PLUGIN_DEFINE_FUNC(bluealsa) {
 		goto fail;
 	}
 
-	int flags = ba_profile | (
-			stream == SND_PCM_STREAM_PLAYBACK ? BA_PCM_FLAG_SOURCE : BA_PCM_FLAG_SINK);
-	if (!bluealsa_dbus_get_pcm(&pcm->dbus_ctx, &ba_addr, flags, &pcm->ba_pcm, &err)) {
+	debug("Getting BlueALSA PCM: %s %s %s", snd_pcm_stream_name(stream), device, profile);
+	if (!bluealsa_dbus_get_pcm(&pcm->dbus_ctx, &ba_addr, ba_profile,
+				stream == SND_PCM_STREAM_PLAYBACK ? BA_PCM_MODE_SINK : BA_PCM_MODE_SOURCE,
+				&pcm->ba_pcm, &err)) {
 		SNDERR("Couldn't get BlueALSA PCM: %s", err.message);
 		ret = -ENODEV;
 		goto fail;
@@ -728,9 +1016,20 @@ SND_PCM_PLUGIN_DEFINE_FUNC(bluealsa) {
 	pcm->io.version = SND_PCM_IOPLUG_VERSION;
 	pcm->io.name = "BlueALSA";
 	pcm->io.flags = SND_PCM_IOPLUG_FLAG_LISTED;
+#ifdef SND_PCM_IOPLUG_FLAG_BOUNDARY_WA
+	pcm->io.flags |= SND_PCM_IOPLUG_FLAG_BOUNDARY_WA;
+#endif
 	pcm->io.mmap_rw = 1;
 	pcm->io.callback = &bluealsa_callback;
 	pcm->io.private_data = pcm;
+
+#if SND_LIB_VERSION >= 0x010102 && SND_LIB_VERSION <= 0x010103
+	/* ALSA library thread-safe API functionality does not play well with ALSA
+	 * IO-plug plug-ins. It causes deadlocks which often make our PCM plug-in
+	 * unusable. As a workaround we are going to disable this functionality. */
+	if (setenv("LIBASOUND_THREAD_SAFE", "0", 0) == -1)
+		SNDERR("Couldn't disable ALSA thread-safe API: %s", strerror(errno));
+#endif
 
 	if ((ret = snd_pcm_ioplug_create(&pcm->io, name, stream, mode)) < 0)
 		goto fail;

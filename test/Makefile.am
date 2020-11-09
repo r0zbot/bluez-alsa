@@ -1,21 +1,29 @@
 # BlueALSA - Makefile.am
-# Copyright (c) 2016-2019 Arkadiusz Bokowy
+# Copyright (c) 2016-2020 Arkadiusz Bokowy
 
 TESTS = \
+	test-a2dp \
+	test-alsa-ctl \
+	test-alsa-pcm \
 	test-at \
+	test-audio \
 	test-ba \
 	test-io \
 	test-msbc \
-	test-pcm \
+	test-rfcomm \
 	test-utils
 
 check_PROGRAMS = \
-	server-mock \
+	bluealsa-mock \
+	test-a2dp \
+	test-alsa-ctl \
+	test-alsa-pcm \
 	test-at \
+	test-audio \
 	test-ba \
 	test-io \
 	test-msbc \
-	test-pcm \
+	test-rfcomm \
 	test-utils
 
 check_LTLIBRARIES = \
@@ -37,6 +45,7 @@ AM_CFLAGS = \
 	@GLIB2_CFLAGS@ \
 	@LDAC_ABR_CFLAGS@ \
 	@LDAC_CFLAGS@ \
+	@LIBUNWIND_CFLAGS@ \
 	@MPG123_CFLAGS@ \
 	@SBC_CFLAGS@
 
@@ -51,6 +60,7 @@ LDADD = \
 	@GLIB2_LIBS@ \
 	@LDAC_ABR_LIBS@ \
 	@LDAC_LIBS@ \
+	@LIBUNWIND_LIBS@ \
 	@MP3LAME_LIBS@ \
 	@MPG123_LIBS@ \
 	@SBC_LIBS@

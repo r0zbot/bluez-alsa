@@ -1,39 +1,14 @@
 # BlueALSA - Makefile.am
-# Copyright (c) 2016-2019 Arkadiusz Bokowy
+# Copyright (c) 2016-2020 Arkadiusz Bokowy
+
+SUBDIRS = aplay rfcomm
 
 bin_PROGRAMS =
 
-if ENABLE_APLAY
-bin_PROGRAMS += bluealsa-aplay
-bluealsa_aplay_SOURCES = \
-	../src/shared/dbus-client.c \
-	../src/shared/ffb.c \
-	../src/shared/log.c \
-	aplay.c
-bluealsa_aplay_CFLAGS = \
-	-I$(top_srcdir)/src \
-	@ALSA_CFLAGS@ \
-	@BLUEZ_CFLAGS@ \
-	@DBUS1_CFLAGS@
-bluealsa_aplay_LDADD = \
-	@ALSA_LIBS@ \
-	@BLUEZ_LIBS@ \
-	@DBUS1_LIBS@
-endif
-
-if ENABLE_RFCOMM
-bin_PROGRAMS += bluealsa-rfcomm
-bluealsa_rfcomm_SOURCES = \
-	../src/shared/dbus-client.c \
-	../src/shared/log.c \
-	rfcomm.c
-bluealsa_rfcomm_CFLAGS = \
-	-I$(top_srcdir)/src \
-	@BLUEZ_CFLAGS@ \
-	@DBUS1_CFLAGS@
-bluealsa_rfcomm_LDADD = \
-	@DBUS1_LIBS@ \
-	-lreadline
+if ENABLE_A2DPCONF
+bin_PROGRAMS += a2dpconf
+a2dpconf_CFLAGS = \
+	-I$(top_srcdir)/src
 endif
 
 if ENABLE_HCITOP

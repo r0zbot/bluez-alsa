@@ -1,5 +1,5 @@
 /*
- * BlueALSA - io.h
+ * BlueALSA - sco.h
  * Copyright (c) 2016-2019 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
@@ -8,15 +8,17 @@
  *
  */
 
-#ifndef BLUEALSA_IO_H_
-#define BLUEALSA_IO_H_
+#ifndef BLUEALSA_SCO_H_
+#define BLUEALSA_SCO_H_
 
 #if HAVE_CONFIG_H
 # include <config.h>
 #endif
 
+#include "ba-adapter.h"
 #include "ba-transport.h"
 
-int io_thread_create(struct ba_transport *t);
+int sco_setup_connection_dispatcher(struct ba_adapter *a);
+void *sco_thread(struct ba_transport *t);
 
 #endif

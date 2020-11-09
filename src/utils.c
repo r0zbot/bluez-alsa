@@ -1,6 +1,6 @@
 /*
  * BlueALSA - utils.c
- * Copyright (c) 2016-2019 Arkadiusz Bokowy
+ * Copyright (c) 2016-2020 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -11,16 +11,11 @@
 #include "utils.h"
 
 #include <ctype.h>
-#include <errno.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include <bluetooth/bluetooth.h>
-#include <bluetooth/hci.h>
-#include <bluetooth/hci_lib.h>
-#include <bluetooth/sco.h>
 
 #if ENABLE_LDAC
 # include "ldacBT.h"
@@ -31,95 +26,6 @@
 #include "hfp.h"
 #include "shared/defs.h"
 #include "shared/log.h"
-
-
-/**
- * Calculate the optimum bitpool for given parameters.
- *
- * @param freq Sampling frequency.
- * @param model Channel mode.
- * @return Coded SBC bitpool. */
-int a2dp_sbc_default_bitpool(int freq, int mode) {
-	switch (freq) {
-	case SBC_SAMPLING_FREQ_16000:
-	case SBC_SAMPLING_FREQ_32000:
-		return 53;
-	case SBC_SAMPLING_FREQ_44100:
-		switch (mode) {
-		case SBC_CHANNEL_MODE_MONO:
-		case SBC_CHANNEL_MODE_DUAL_CHANNEL:
-			return 31;
-		case SBC_CHANNEL_MODE_STEREO:
-		case SBC_CHANNEL_MODE_JOINT_STEREO:
-			return 53;
-		default:
-			warn("Invalid channel mode: %u", mode);
-			return 53;
-		}
-	case SBC_SAMPLING_FREQ_48000:
-		switch (mode) {
-		case SBC_CHANNEL_MODE_MONO:
-		case SBC_CHANNEL_MODE_DUAL_CHANNEL:
-			return 29;
-		case SBC_CHANNEL_MODE_STEREO:
-		case SBC_CHANNEL_MODE_JOINT_STEREO:
-			return 51;
-		default:
-			warn("Invalid channel mode: %u", mode);
-			return 51;
-		}
-	default:
-		warn("Invalid sampling freq: %u", freq);
-		return 53;
-	}
-}
-
-/**
- * Open SCO link for given Bluetooth device.
- *
- * @param dev_id The ID of the HCI device for which the SCO link should be
- *   established.
- * @param ba Pointer to the Bluetooth address structure for a target device.
- * @param transparent Use transparent mode for voice transmission.
- * @return On success this function returns socket file descriptor. Otherwise,
- *   -1 is returned and errno is set to indicate the error. */
-int hci_open_sco(int dev_id, const bdaddr_t *ba, bool transparent) {
-
-	struct sockaddr_sco addr_hci = {
-		.sco_family = AF_BLUETOOTH,
-	};
-	struct sockaddr_sco addr_dev = {
-		.sco_family = AF_BLUETOOTH,
-		.sco_bdaddr = *ba,
-	};
-	int dd, err;
-
-	if (hci_devba(dev_id, &addr_hci.sco_bdaddr) == -1)
-		return -1;
-	if ((dd = socket(PF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_SCO)) == -1)
-		return -1;
-	if (bind(dd, (struct sockaddr *)&addr_hci, sizeof(addr_hci)) == -1)
-		goto fail;
-
-	if (transparent) {
-		struct bt_voice voice = {
-			.setting = BT_VOICE_TRANSPARENT,
-		};
-		if (setsockopt(dd, SOL_BLUETOOTH, BT_VOICE, &voice, sizeof(voice)) == -1)
-			goto fail;
-	}
-
-	if (connect(dd, (struct sockaddr *)&addr_dev, sizeof(addr_dev)) == -1)
-		goto fail;
-
-	return dd;
-
-fail:
-	err = errno;
-	close(dd);
-	errno = err;
-	return -1;
-}
 
 /**
  * Extract HCI device ID from the BlueZ D-Bus object path.
@@ -142,23 +48,19 @@ int g_dbus_bluez_object_path_to_hci_dev_id(const char *path) {
  *   error, NULL is returned. */
 bdaddr_t *g_dbus_bluez_object_path_to_bdaddr(const char *path, bdaddr_t *addr) {
 
-	char *tmp, *p;
+	char tmp[sizeof("00:00:00:00:00:00")] = { 0 };
+	size_t i;
 
-	if ((path = strstr(path, "/dev_")) == NULL)
-		return NULL;
-	if ((tmp = strdup(path + 5)) == NULL)
-		return NULL;
+	if ((path = strstr(path, "/dev_")) != NULL)
+		strncpy(tmp, path + 5, sizeof(tmp) - 1);
 
-	for (p = tmp; *p != '\0'; p++)
-		if (*p == '_')
-			*p = ':';
-		else if (*p == '/')
-			*p = '\0';
+	for (i = 0; i < sizeof(tmp); i++)
+		if (tmp[i] == '_')
+			tmp[i] = ':';
 
 	if (str2ba(tmp, addr) == -1)
-		addr = NULL;
+		return NULL;
 
-	free(tmp);
 	return addr;
 }
 
@@ -175,17 +77,21 @@ const char *g_dbus_transport_type_to_bluez_object_path(struct ba_transport_type 
 			return "/A2DP/SBC/Source";
 #if ENABLE_MPEG
 		case A2DP_CODEC_MPEG12:
-			return "/A2DP/MPEG12/Source";
+			return "/A2DP/MPEG/Source";
 #endif
 #if ENABLE_AAC
 		case A2DP_CODEC_MPEG24:
-			return "/A2DP/MPEG24/Source";
+			return "/A2DP/AAC/Source";
 #endif
 #if ENABLE_APTX
 		case A2DP_CODEC_VENDOR_APTX:
 			return "/A2DP/APTX/Source";
 		case A2DP_CODEC_VENDOR_APTX_HD:
-			return "/A2DP/APTXHD/Source";
+			return "/A2DP/aptXHD/Source";
+#endif
+#if ENABLE_FASTSTREAM
+		case A2DP_CODEC_VENDOR_FASTSTREAM:
+			return "/A2DP/FastStream/Source";
 #endif
 #if ENABLE_LDAC
 		case A2DP_CODEC_VENDOR_LDAC:
@@ -201,17 +107,21 @@ const char *g_dbus_transport_type_to_bluez_object_path(struct ba_transport_type 
 			return "/A2DP/SBC/Sink";
 #if ENABLE_MPEG
 		case A2DP_CODEC_MPEG12:
-			return "/A2DP/MPEG12/Sink";
+			return "/A2DP/MPEG/Sink";
 #endif
 #if ENABLE_AAC
 		case A2DP_CODEC_MPEG24:
-			return "/A2DP/MPEG24/Sink";
+			return "/A2DP/AAC/Sink";
 #endif
 #if ENABLE_APTX
 		case A2DP_CODEC_VENDOR_APTX:
 			return "/A2DP/APTX/Sink";
 		case A2DP_CODEC_VENDOR_APTX_HD:
-			return "/A2DP/APTXHD/Sink";
+			return "/A2DP/aptXHD/Sink";
+#endif
+#if ENABLE_FASTSTREAM
+		case A2DP_CODEC_VENDOR_FASTSTREAM:
+			return "/A2DP/FastStream/Sink";
 #endif
 #if ENABLE_LDAC
 		case A2DP_CODEC_VENDOR_LDAC:
@@ -234,119 +144,6 @@ const char *g_dbus_transport_type_to_bluez_object_path(struct ba_transport_type 
 }
 
 /**
- * Get managed objects of a given D-Bus service. */
-GVariantIter *g_dbus_get_managed_objects(GDBusConnection *conn,
-		const char *name, const char *path, GError **error) {
-
-	GDBusMessage *msg = NULL, *rep = NULL;
-	GVariantIter *objects = NULL;
-
-	msg = g_dbus_message_new_method_call(name, path,
-			"org.freedesktop.DBus.ObjectManager", "GetManagedObjects");
-
-	if ((rep = g_dbus_connection_send_message_with_reply_sync(conn, msg,
-					G_DBUS_SEND_MESSAGE_FLAGS_NONE, -1, NULL, NULL, error)) == NULL)
-		goto fail;
-
-	if (g_dbus_message_get_message_type(rep) == G_DBUS_MESSAGE_TYPE_ERROR) {
-		g_dbus_message_to_gerror(rep, error);
-		goto fail;
-	}
-
-	g_variant_get(g_dbus_message_get_body(rep), "(a{oa{sa{sv}}})", &objects);
-
-fail:
-
-	if (msg != NULL)
-		g_object_unref(msg);
-	if (rep != NULL)
-		g_object_unref(rep);
-
-	return objects;
-}
-
-/**
- * Get a property of a given D-Bus interface.
- *
- * @param conn D-Bus connection handler.
- * @param service Valid D-Bus service name.
- * @param path Valid D-Bus object path.
- * @param interface Interface with the given property.
- * @param property The property name.
- * @param error NULL GError pointer.
- * @return On success this function returns variant containing property value.
- *   Otherwise, NULL is returned. */
-GVariant *g_dbus_get_property(GDBusConnection *conn, const char *service,
-		const char *path, const char *interface, const char *property,
-		GError **error) {
-
-	GDBusMessage *msg = NULL, *rep = NULL;
-	GVariant *value = NULL;
-
-	msg = g_dbus_message_new_method_call(service, path, "org.freedesktop.DBus.Properties", "Get");
-	g_dbus_message_set_body(msg, g_variant_new("(ss)", interface, property));
-
-	if ((rep = g_dbus_connection_send_message_with_reply_sync(conn, msg,
-					G_DBUS_SEND_MESSAGE_FLAGS_NONE, -1, NULL, NULL, error)) == NULL)
-		goto fail;
-
-	if (g_dbus_message_get_message_type(rep) == G_DBUS_MESSAGE_TYPE_ERROR) {
-		g_dbus_message_to_gerror(rep, error);
-		goto fail;
-	}
-
-	g_variant_get(g_dbus_message_get_body(rep), "(v)", &value);
-
-fail:
-
-	if (msg != NULL)
-		g_object_unref(msg);
-	if (rep != NULL)
-		g_object_unref(rep);
-
-	return value;
-}
-
-/**
- * Set a property of a given D-Bus interface.
- *
- * @param conn D-Bus connection handler.
- * @param service Valid D-Bus service name.
- * @param path Valid D-Bus object path.
- * @param interface Interface with the given property.
- * @param property The property name.
- * @param value Variant containing property value.
- * @param error NULL GError pointer.
- * @return On success this function returns true. */
-bool g_dbus_set_property(GDBusConnection *conn, const char *service,
-		const char *path, const char *interface, const char *property,
-		const GVariant *value, GError **error) {
-
-	GDBusMessage *msg = NULL, *rep = NULL;
-
-	msg = g_dbus_message_new_method_call(service, path, "org.freedesktop.DBus.Properties", "Set");
-	g_dbus_message_set_body(msg, g_variant_new("(ssv)", interface, property, value));
-
-	if ((rep = g_dbus_connection_send_message_with_reply_sync(conn, msg,
-					G_DBUS_SEND_MESSAGE_FLAGS_NONE, -1, NULL, NULL, error)) == NULL)
-		goto fail;
-
-	if (g_dbus_message_get_message_type(rep) == G_DBUS_MESSAGE_TYPE_ERROR) {
-		g_dbus_message_to_gerror(rep, error);
-		goto fail;
-	}
-
-fail:
-
-	if (msg != NULL)
-		g_object_unref(msg);
-	if (rep != NULL)
-		g_object_unref(rep);
-
-	return error == NULL;
-}
-
-/**
  * Sanitize D-Bus object path.
  *
  * @param path D-Bus object path.
@@ -363,71 +160,55 @@ char *g_variant_sanitize_object_path(char *path) {
 }
 
 /**
- * Convert Bluetooth address into a human-readable string.
+ * Convenience wrapper around g_variant_is_of_type().
  *
- * This function returns statically allocated buffer. It is not by any means
- * thread safe. This function should be used for debugging purposes only.
- *
- * For debugging purposes, one could use the batostr() function provided by
- * the bluez library. However, this function converts the Bluetooth address
- * to the string with a incorrect (reversed) bytes order...
- *
- * @param ba Pointer to the Bluetooth address structure.
- * @return On success this function returns statically allocated buffer with
- *   human-readable Bluetooth address. On error, it returns NULL. */
-const char *batostr_(const bdaddr_t *ba) {
-	static char addr[18];
-	if (ba2str(ba, addr) > 0)
-		return addr;
-	return NULL;
+ * @param value Variant for validation.
+ * @param type Expected variant type.
+ * @param name Variant name for logging.
+ * @return If variant matches type, this function returns true. */
+bool g_variant_validate_value(GVariant *value, const GVariantType *type,
+		const char *name) {
+	if (g_variant_is_of_type(value, type))
+		return true;
+	warn("Invalid variant type: %s: %s != %s", name,
+			g_variant_get_type_string(value), (const char *)type);
+	return false;
 }
 
 /**
- * Scale PCM signal stored in the buffer.
+ * Convert a pointer to BT address to a hash value.
  *
- * Neutral value for scaling factor is 1.0. It is possible to increase
- * signal gain by using scaling factor values greater than 1, however
- * clipping will most certainly occur.
- *
- * @param buffer Address to the buffer where the PCM signal is stored.
- * @param size The number of samples in the buffer.
- * @param channels The number of channels in the buffer.
- * @param ch1_scale The scaling factor for 1st channel.
- * @param ch1_scale The scaling factor for 2nd channel. */
-void snd_pcm_scale_s16le(int16_t *buffer, size_t size, int channels,
-		double ch1_scale, double ch2_scale) {
-	switch (channels) {
-	case 1:
-		if (ch1_scale != 1.0)
-			while (size--)
-				buffer[size] = buffer[size] * ch1_scale;
-		break;
-	case 2:
-		if (ch1_scale != 1.0 || ch2_scale != 1.0)
-			while (size--) {
-				double scale = size % 2 == 0 ? ch1_scale : ch2_scale;
-				buffer[size] = buffer[size] * scale;
-			}
-		break;
-	}
+ * @param v A pointer to bdaddr_t structure.
+ * @return Hash value compatible with GHashTable. */
+unsigned int g_bdaddr_hash(const void *v) {
+	const bdaddr_t *ba = (const bdaddr_t *)v;
+	return ((uint32_t *)ba->b)[0] * ((uint16_t *)ba->b)[2];
 }
 
 /**
- * Convert Bluetooth A2DP codec into a human-readable string.
+ * Compare two BT addresses.
  *
- * @param codec Bluetooth A2DP audio codec.
- * @return Human-readable string. */
-const char *bluetooth_a2dp_codec_to_string(uint16_t codec) {
-	switch (codec) {
-	case A2DP_CODEC_SBC:
-		return "SBC";
+ * @param v1 A pointer to first bdaddr_t structure.
+ * @param v2 A pointer to second bdaddr_t structure.
+ * @return Comparision value compatible with GHashTable. */
+gboolean g_bdaddr_equal(const void *v1, const void *v2) {
+	return bacmp(v1, v2) == 0;
+}
+
+/**
+ * Get BlueALSA A2DP codec from string representation.
+ *
+ * @param codec String representation of BlueALSA audio codec.
+ * @return BlueALSA audio codec or 0xFFFF for not supported value. */
+uint16_t ba_transport_codecs_a2dp_from_string(const char *str) {
+
+	static const uint16_t codecs[] = {
+		A2DP_CODEC_SBC,
 #if ENABLE_MPEG
-	case A2DP_CODEC_MPEG12:
-		return "MPEG";
+		A2DP_CODEC_MPEG12,
 #endif
 #if ENABLE_AAC
-	case A2DP_CODEC_MPEG24:
-		return "AAC";
+		A2DP_CODEC_MPEG24,
 #endif
 #if ENABLE_APTX
 	case A2DP_CODEC_VENDOR_APTX:
@@ -436,12 +217,98 @@ const char *bluetooth_a2dp_codec_to_string(uint16_t codec) {
 		return "APT-X HD";
 #endif
 #if ENABLE_LDAC
+		A2DP_CODEC_VENDOR_LDAC,
+#endif
+	};
+
+	size_t i;
+	for (i = 0; i < ARRAYSIZE(codecs); i++)
+		if (strcmp(str, ba_transport_codecs_a2dp_to_string(codecs[i])) == 0)
+			return codecs[i];
+
+	return 0xFFFF;
+}
+
+/**
+ * Convert BlueALSA A2DP codec into a human-readable string.
+ *
+ * @param codec BlueALSA A2DP audio codec.
+ * @return Human-readable string or NULL for unknown codec. */
+const char *ba_transport_codecs_a2dp_to_string(uint16_t codec) {
+	switch (codec) {
+	case A2DP_CODEC_SBC:
+		return "SBC";
+	case A2DP_CODEC_MPEG12:
+		return "MP3";
+	case A2DP_CODEC_MPEG24:
+		return "AAC";
+	case A2DP_CODEC_ATRAC:
+		return "ATRAC";
+	case A2DP_CODEC_VENDOR_APTX:
+		return "aptX";
+	case A2DP_CODEC_VENDOR_APTX_AD:
+		return "aptX-AD";
+	case A2DP_CODEC_VENDOR_APTX_HD:
+		return "aptX-HD";
+	case A2DP_CODEC_VENDOR_APTX_LL:
+		return "aptX-LL";
+	case A2DP_CODEC_VENDOR_APTX_TWS:
+		return "aptX-TWS";
+	case A2DP_CODEC_VENDOR_FASTSTREAM:
+		return "FastStream";
 	case A2DP_CODEC_VENDOR_LDAC:
 		return "LDAC";
-#endif
+	case A2DP_CODEC_VENDOR_LHDC:
+		return "LHDC";
+	case A2DP_CODEC_VENDOR_LHDC_V1:
+		return "LHDCv1";
+	case A2DP_CODEC_VENDOR_LLAC:
+		return "LLAC";
+	case A2DP_CODEC_VENDOR_SAMSUNG_HD:
+		return "samsung-HD";
+	case A2DP_CODEC_VENDOR_SAMSUNG_SC:
+		return "samsung-SC";
+	default:
+		return NULL;
 	}
-	debug("Unknown codec: %#x", codec);
-	return "N/A";
+}
+
+/**
+ * Get BlueALSA HFP codec from string representation.
+ *
+ * @param codec String representation of BlueALSA audio codec.
+ * @return BlueALSA audio codec or 0xFFFF for not supported value. */
+uint16_t ba_transport_codecs_hfp_from_string(const char *str) {
+
+	static const uint16_t codecs[] = {
+		HFP_CODEC_CVSD,
+#if ENABLE_MSBC
+		HFP_CODEC_MSBC,
+#endif
+	};
+
+	size_t i;
+	for (i = 0; i < ARRAYSIZE(codecs); i++)
+		if (strcmp(str, ba_transport_codecs_hfp_to_string(codecs[i])) == 0)
+			return codecs[i];
+
+	return 0xFFFF;
+}
+
+/**
+ * Convert HFP audio codec into a human-readable string.
+ *
+ * @param codec HFP audio codec.
+ * @return Human-readable string or NULL for unknown codec. */
+const char *ba_transport_codecs_hfp_to_string(uint16_t codec) {
+	switch (codec) {
+	case HFP_CODEC_CVSD:
+		return "CVSD";
+	case HFP_CODEC_MSBC:
+		return "mSBC";
+	default:
+		return NULL;
+	}
 }
 
 /**
@@ -457,7 +324,7 @@ const char *ba_transport_type_to_string(struct ba_transport_type type) {
 			return "A2DP Source (SBC)";
 #if ENABLE_MPEG
 		case A2DP_CODEC_MPEG12:
-			return "A2DP Source (MPEG)";
+			return "A2DP Source (MP3)";
 #endif
 #if ENABLE_AAC
 		case A2DP_CODEC_MPEG24:
@@ -467,7 +334,11 @@ const char *ba_transport_type_to_string(struct ba_transport_type type) {
 		case A2DP_CODEC_VENDOR_APTX:
 			return "A2DP Source (APT-X)";
 		case A2DP_CODEC_VENDOR_APTX_HD:
-			return "A2DP Source (APT-X HD)";
+			return "A2DP Source (aptX HD)";
+#endif
+#if ENABLE_FASTSTREAM
+		case A2DP_CODEC_VENDOR_FASTSTREAM:
+			return "A2DP Source (FastStream)";
 #endif
 #if ENABLE_LDAC
 		case A2DP_CODEC_VENDOR_LDAC:
@@ -482,7 +353,7 @@ const char *ba_transport_type_to_string(struct ba_transport_type type) {
 			return "A2DP Sink (SBC)";
 #if ENABLE_MPEG
 		case A2DP_CODEC_MPEG12:
-			return "A2DP Sink (MPEG)";
+			return "A2DP Sink (MP3)";
 #endif
 #if ENABLE_AAC
 		case A2DP_CODEC_MPEG24:
@@ -492,7 +363,11 @@ const char *ba_transport_type_to_string(struct ba_transport_type type) {
 		case A2DP_CODEC_VENDOR_APTX:
 			return "A2DP Sink (APT-X)";
 		case A2DP_CODEC_VENDOR_APTX_HD:
-			return "A2DP Sink (APT-X HD)";
+			return "A2DP Sink (aptX HD)";
+#endif
+#if ENABLE_FASTSTREAM
+		case A2DP_CODEC_VENDOR_FASTSTREAM:
+			return "A2DP Sink (FastStream)";
 #endif
 #if ENABLE_LDAC
 		case A2DP_CODEC_VENDOR_LDAC:
@@ -523,14 +398,6 @@ const char *ba_transport_type_to_string(struct ba_transport_type type) {
 		return "HSP Headset";
 	case BA_TRANSPORT_PROFILE_HSP_AG:
 		return "HSP Audio Gateway";
-	case BA_TRANSPORT_PROFILE_RFCOMM | BA_TRANSPORT_PROFILE_HFP_HF:
-		return "RFCOMM: HFP Hands-Free";
-	case BA_TRANSPORT_PROFILE_RFCOMM | BA_TRANSPORT_PROFILE_HFP_AG:
-		return "RFCOMM: HFP Audio Gateway";
-	case BA_TRANSPORT_PROFILE_RFCOMM | BA_TRANSPORT_PROFILE_HSP_HS:
-		return "RFCOMM: HSP Headset";
-	case BA_TRANSPORT_PROFILE_RFCOMM | BA_TRANSPORT_PROFILE_HSP_AG:
-		return "RFCOMM: HSP Audio Gateway";
 	}
 	debug("Unknown transport type: %#x %#x", type.profile, type.codec);
 	return "N/A";
@@ -693,6 +560,30 @@ const char *aacenc_strerror(AACENC_ERROR err) {
 		debug("Unknown error code: %#x", err);
 		return "Unknown error";
 	}
+}
+#endif
+
+#if ENABLE_APTX
+/**
+ * Destroy apt-X encoder and free handler.
+ *
+ * @param enc Initialized encoder handler. */
+void aptxbtenc_destroy_free(APTXENC enc) {
+	if (aptxbtenc_destroy != NULL)
+		aptxbtenc_destroy(enc);
+	free(enc);
+}
+#endif
+
+#if ENABLE_APTX_HD
+/**
+ * Destroy apt-X HD encoder and free handler.
+ *
+ * @param enc Initialized encoder handler. */
+void aptxhdbtenc_destroy_free(APTXENC enc) {
+	if (aptxhdbtenc_destroy != NULL)
+		aptxhdbtenc_destroy(enc);
+	free(enc);
 }
 #endif
 

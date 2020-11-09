@@ -1,7 +1,6 @@
 /*
  * BlueALSA - msbc.h
  * Copyright (c) 2016-2019 Arkadiusz Bokowy
- *               2017 Juha Kuikka
  *
  * This file is a part of bluez-alsa.
  *
@@ -31,21 +30,15 @@
 #define MSBC_FRAMELEN    57
 
 #define ESCO_H2_SYNCWORD 0x801
+#define ESCO_H2_GET_SYNCWORD(h2) ((h2) & 0xFFF)
+#define ESCO_H2_GET_SN0(h2)      (((h2) >> 12) & 0x3)
+#define ESCO_H2_GET_SN1(h2)      (((h2) >> 14) & 0x3)
+/* Pack two repetition code protected 2-bit sequence numbers (both bits
+ * duplicated) into the 16-bit eSCO H2 header. Note, that after packing,
+ * the H2 header value has to be converted to little-endian. */
+#define ESCO_H2_PACK(sn0, sn1) (ESCO_H2_SYNCWORD | (sn0) << 12 | (sn1) << 14)
 
-/**
- * Synchronization header for eSCO transparent data. */
-typedef struct esco_h2_header {
-	union {
-		struct {
-			uint16_t sync:12;
-			uint16_t sn0:2;
-			uint16_t sn1:2;
-		};
-		/* raw accessors */
-		uint16_t _raw;
-	};
-} __attribute__ ((packed)) esco_h2_header_t;
-
+typedef uint16_t esco_h2_header_t;
 typedef struct esco_msbc_frame {
 	esco_h2_header_t header;
 	uint8_t payload[MSBC_FRAMELEN];
@@ -60,27 +53,30 @@ struct esco_msbc {
 	sbc_t enc_sbc;
 
 	/* buffer for incoming eSCO frames */
-	ffb_uint8_t dec_data;
+	ffb_t dec_data;
 	/* buffer for outgoing PCM samples */
-	ffb_int16_t dec_pcm;
+	ffb_t dec_pcm;
 
 	/* buffer for incoming PCM samples */
-	ffb_int16_t enc_pcm;
+	ffb_t enc_pcm;
 	/* buffer for outgoing eSCO frames */
-	ffb_uint8_t enc_data;
+	ffb_t enc_data;
 
+	uint8_t dec_seq_initialized : 1;
+	uint8_t dec_seq_number : 2;
+	uint8_t enc_seq_number : 2;
 	size_t enc_frames;
 
 	/* Determine whether structure has been initialized. This field is
 	 * used for reinitialization - it makes msbc_init() idempotent. */
-	bool init;
+	bool initialized;
 
 };
 
 int msbc_init(struct esco_msbc *msbc);
 void msbc_finish(struct esco_msbc *msbc);
 
-void msbc_decode(struct esco_msbc *msbc);
-void msbc_encode(struct esco_msbc *msbc);
+int msbc_decode(struct esco_msbc *msbc);
+int msbc_encode(struct esco_msbc *msbc);
 
 #endif
